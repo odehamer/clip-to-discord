@@ -32,7 +32,7 @@ The script finds a winget-installed ffmpeg on its own. If you installed it anoth
 ### 2. Get the code
 
 ```
-git clone https://github.com/YOUR_USERNAME/clip-to-discord.git
+git clone https://github.com/odehamer/clip-to-discord.git
 cd clip-to-discord
 ```
 
