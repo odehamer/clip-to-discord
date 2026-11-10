@@ -1,0 +1,13 @@
+{
+  "webhook_url": "PASTE_YOUR_DISCORD_WEBHOOK_URL_HERE",
+  "watch_dir": "",
+  "clip_seconds": 30,
+  "max_upload_mb": 10,
+  "height": 720,
+  "fps": 60,
+  "audio_kbps": 96,
+  "delete_original_after_upload": true,
+  "poll_seconds": 2,
+  "filename_suffix": ".DVR.mp4",
+  "ffmpeg_path": null
+}
