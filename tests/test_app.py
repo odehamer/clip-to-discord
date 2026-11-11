@@ -3,6 +3,8 @@ import hashlib
 import http.server
 import json
 import os
+import re
+import shutil
 import sys
 import tempfile
 import threading
@@ -16,6 +18,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import app  # noqa: E402
 import clip_watcher  # noqa: E402
+
+DEST_A = clip_watcher.Destination("Friends #clips", "https://discord.com/api/webhooks/1/aaa", True)
+DEST_B = clip_watcher.Destination("Work", "https://discord.com/api/webhooks/2/bbb", True)
+SYNTH_CLIP = Path("C:/Users/oscar/AppData/Local/Temp/claude/4770acc3d7bcc157/7eaf93fb-4e67-494b-bd92-d4c4351be103/"
+                  "scratchpad/cliptest/Test Game/Test Game 2026.11.10 - 12.00.00.01.DVR.mp4")
 
 
 def make_zip(path: Path, hostile: bool = True) -> None:
@@ -135,12 +142,13 @@ class ConfigTests(unittest.TestCase):
             p.write_text(json.dumps({"webhook_url": "old", "clip_seconds": 20, "max_upload_mb": 50,
                                      "custom": "x"}))
             url = "https://discord.com/api/webhooks/1/abc"
-            app.save_config(p, url, False)
+            app.save_config(p, [clip_watcher.Destination("Mine", url, True)], False)
             data = json.loads(p.read_text())
             self.assertEqual(data["clip_seconds"], 20)
             self.assertEqual(data["max_upload_mb"], 50)
             self.assertEqual(data["custom"], "x")
-            self.assertEqual(data["webhook_url"], url)
+            self.assertNotIn("webhook_url", data)
+            self.assertEqual(data["destinations"], [{"name": "Mine", "url": url, "enabled": True}])
             self.assertIs(data["delete_original_after_upload"], False)
             self.assertTrue(app.has_valid_config(p))
 
@@ -148,8 +156,9 @@ class ConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / "sub" / "config.json"
             self.assertFalse(app.has_valid_config(p))
-            app.save_config(p, "https://discord.com/api/webhooks/1/abc", True)
+            app.save_config(p, [DEST_A], True)
             self.assertTrue(p.is_file())
+            self.assertTrue(app.has_valid_config(p))
 
     def test_default_paths_env(self):
         with mock.patch.dict(os.environ, {app.HOME_ENV: r"C:\somewhere"}):
@@ -354,11 +363,7 @@ class GuiSmokeTests(unittest.TestCase):
                 self.assertEqual(w.delete_cb.cget("text"),
                                  "Delete the original clip after it's posted. "
                                  "The Discord copy will be the only copy.")
-                self.assertEqual(w.entry.cget("show"), "•")
-                # invalid URL gives an inline error, no popup
-                w.webhook_var.set("nonsense")
-                w.on_test()
-                self.assertIn("webhook", w.msg_var.get())
+                self.assertEqual(w.name_var.get(), "")
                 w.show_progress("Downloading video tools… 1 of 110 MB", 0.01)
                 a.root.update()
                 w.hide_progress()
@@ -462,11 +467,39 @@ class GameNameTests(unittest.TestCase):
 
 
 class MultiSourceWatchTests(unittest.TestCase):
-    def _run(self, cfg, actions):
-        """Run watch() with process_clip recording (file name, source); actions runs meanwhile."""
+    def setUp(self):
+        self._scans: list[str] = []
+        self._scan_lock = threading.Lock()
+
+    def wait_scans(self, folder, extra=2, timeout=10.0):
+        """Block until the watcher has scanned `folder` `extra` more times than it had so far,
+        so the test acts on the watcher's progress instead of on fixed sleeps."""
+        folder = str(folder)
+        with self._scan_lock:
+            target = self._scans.count(folder) + extra
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with self._scan_lock:
+                if self._scans.count(folder) >= target:
+                    return
+            time.sleep(0.01)
+        self.fail(f"watcher did not scan {folder} in time")
+
+    def _run(self, cfg, actions, watched):
+        """Run watch() with process_clip recording (file name, source); actions runs once every
+        folder in `watched` has been scanned, and the run ends after two more full polls."""
         stop = threading.Event()
         calls = []
+        real_scan = clip_watcher.scan
+
+        def counting_scan(d, suffix):
+            result = real_scan(d, suffix)
+            with self._scan_lock:
+                self._scans.append(str(d))
+            return result
+
         with mock.patch.object(clip_watcher, "wait_until_stable", return_value=True), \
+                mock.patch.object(clip_watcher, "scan", side_effect=counting_scan), \
                 mock.patch.object(clip_watcher, "process_clip",
                                   side_effect=lambda cfg, tools, p, dry_run, source=None:
                                   calls.append((p.name, source))):
@@ -474,9 +507,11 @@ class MultiSourceWatchTests(unittest.TestCase):
                                  args=(cfg, (Path("a"), Path("b")), stop))
             t.start()
             try:
-                time.sleep(0.3)
+                for folder in watched:
+                    self.wait_scans(folder, extra=1)
                 actions()
-                time.sleep(0.5)
+                for folder in watched:
+                    self.wait_scans(folder, extra=2)
             finally:
                 stop.set()
                 t.join(3)
@@ -496,7 +531,7 @@ class MultiSourceWatchTests(unittest.TestCase):
                 (nv / "plain.mp4").write_bytes(b"2")
                 (md / "MedalTVValorant1.mp4").write_bytes(b"3")
 
-            calls = self._run(cfg, act)
+            calls = self._run(cfg, act, [nv, md])
             by_name = {n: s for n, s in calls}
             self.assertEqual(len(calls), 2)
             self.assertEqual(by_name["G 2026.01.02 - 03.04.05.06.DVR.mp4"].name, "NVIDIA")
@@ -509,7 +544,7 @@ class MultiSourceWatchTests(unittest.TestCase):
             nv.mkdir()
             cfg = clip_watcher.Config(webhook_url="x", watch_dir=str(nv), medal_enabled=True,
                                       medal_dir=str(nv), filename_suffix=".mp4", poll_seconds=0.05)
-            calls = self._run(cfg, lambda: (nv / "a.mp4").write_bytes(b"1"))
+            calls = self._run(cfg, lambda: (nv / "a.mp4").write_bytes(b"1"), [nv])
             self.assertEqual([(n, s.name) for n, s in calls], [("a.mp4", "NVIDIA")])
 
     def test_medal_dir_created_later(self):
@@ -522,17 +557,17 @@ class MultiSourceWatchTests(unittest.TestCase):
             def act():
                 md.mkdir()
                 (md / "initial.mp4").write_bytes(b"1")
-                time.sleep(0.4)
+                self.wait_scans(md, extra=1)  # the Medal folder's first scan is its baseline
                 (md / "later.mp4").write_bytes(b"2")
 
-            calls = self._run(cfg, act)
+            calls = self._run(cfg, act, [nv])
             self.assertEqual([(n, s.name) for n, s in calls], [("later.mp4", "Medal")])
 
 
 class MedalConfigTests(unittest.TestCase):
     def test_merge_new_keys_keeps_unknown(self):
         merged = app.merge_config({"custom": 1, "clip_seconds": 20, "watch_dir": "V"},
-                                  "u", True, False, True, r"D:\Medal\Clips")
+                                  [DEST_A], True, False, True, r"D:\Medal\Clips")
         self.assertEqual(merged["custom"], 1)
         self.assertEqual(merged["clip_seconds"], 20)
         self.assertEqual(merged["watch_dir"], "V")
@@ -544,7 +579,7 @@ class MedalConfigTests(unittest.TestCase):
     def test_save_config_roundtrip(self):
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / "config.json"
-            app.save_config(p, "https://discord.com/api/webhooks/1/abc", False, True, True, "M")
+            app.save_config(p, [DEST_A], False, True, True, "M")
             cfg = clip_watcher.load_config(p, False)
             self.assertTrue(cfg.nvidia_enabled and cfg.medal_enabled)
             self.assertEqual(cfg.medal_dir, "M")
@@ -607,7 +642,7 @@ class SourceWindowTests(unittest.TestCase):
                 self.assertFalse(w.medal_var.get())
                 self.assertTrue(hasattr(w, "warning"))
                 self.assertEqual(str(w.medal_browse_btn.cget("state")), "disabled")
-                w.webhook_var.set("https://discord.com/api/webhooks/1/abc")
+                w.destinations.append(DEST_A)
 
                 w.nvidia_var.set(False)
                 w.on_save()
@@ -642,7 +677,7 @@ class SourceWindowTests(unittest.TestCase):
                     self.assertFalse(w.nvidia_var.get())
                     self.assertTrue(w.medal_var.get())
                     self.assertFalse(hasattr(w, "warning"))
-                    w.webhook_var.set("https://discord.com/api/webhooks/1/abc")
+                    w.destinations.append(DEST_A)
                     w.medal_dir_var.set(str(medal))  # capture folder -> Clips inside it
                     w.on_save()
                     saved = json.loads(app.default_paths().config.read_text())
@@ -651,6 +686,455 @@ class SourceWindowTests(unittest.TestCase):
                     self.assertEqual(saved["medal_dir"], str(medal / "Clips"))
                 finally:
                     self._close(a)
+
+
+class PlayerNameTests(unittest.TestCase):
+    def test_validate(self):
+        v = clip_watcher.validate_player_name
+        self.assertIsNone(v(""))
+        self.assertIsNone(v("   "))
+        self.assertIsNone(v("a" * 32))
+        self.assertIsNotNone(v("a" * 33))
+        self.assertIsNone(v("  " + "a" * 32 + "  "))   # trimmed before counting
+        self.assertIsNotNone(v("Discord Dad"))
+        self.assertIsNotNone(v("clydeX"))
+        self.assertIsNotNone(v("my CLYDE"))
+        self.assertIsNone(v("Oscar"))
+
+    def test_payload(self):
+        p = clip_watcher.build_payload("**Game**")
+        self.assertEqual(p, {"content": "**Game**", "allowed_mentions": {"parse": []}})
+        p = clip_watcher.build_payload("**Game**", "  Oscar ")
+        self.assertEqual(p["username"], "Oscar")
+        self.assertEqual(p["allowed_mentions"], {"parse": []})
+        self.assertNotIn("username", clip_watcher.build_payload("x", "   "))
+
+    def test_effective_name_drops_rejected_names(self):
+        self.assertEqual(clip_watcher.effective_player_name(clip_watcher.Config(player_name=" Bob ")), "Bob")
+        self.assertEqual(clip_watcher.effective_player_name(clip_watcher.Config(player_name="Discord")), "")
+
+
+class GetDestinationsTests(unittest.TestCase):
+    def test_old_config_migrates(self):
+        url = "https://discord.com/api/webhooks/1/abc"
+        for cfg in (clip_watcher.Config(webhook_url=url), {"webhook_url": url}):
+            self.assertEqual(clip_watcher.get_destinations(cfg),
+                             [clip_watcher.Destination("My server", url, True)])
+        self.assertEqual(clip_watcher.get_destinations(clip_watcher.Config(webhook_url="PASTE_YOUR_URL")), [])
+        self.assertEqual(clip_watcher.get_destinations(clip_watcher.Config()), [])
+
+    def test_explicit_list(self):
+        cfg = clip_watcher.Config(webhook_url="https://discord.com/api/webhooks/9/old", destinations=[
+            {"name": "A", "url": "https://discord.com/api/webhooks/1/a", "enabled": True},
+            {"name": "B", "url": "https://discord.com/api/webhooks/2/b", "enabled": False},
+            {"name": "Bad", "url": "https://example.com/nope", "enabled": True},
+            {"name": "  C ", "url": "https://discordapp.com/api/webhooks/3/c"},
+        ])
+        with self.assertLogs("clip_watcher", "WARNING") as logs:
+            got = clip_watcher.get_destinations(cfg)
+        self.assertEqual([(d.name, d.enabled) for d in got], [("A", True), ("B", False), ("C", True)])
+        self.assertNotIn("example.com", "\n".join(logs.output))
+        self.assertEqual([d.name for d in clip_watcher.enabled_destinations(cfg)], ["A", "C"])
+
+    def test_empty_list_is_authoritative(self):
+        cfg = clip_watcher.Config(webhook_url="https://discord.com/api/webhooks/9/old", destinations=[])
+        self.assertEqual(clip_watcher.get_destinations(cfg), [])
+
+    def test_load_config_keeps_the_difference(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "c.json"
+            p.write_text(json.dumps({"webhook_url": "https://discord.com/api/webhooks/1/a"}))
+            self.assertIsNone(clip_watcher.load_config(p, False).destinations)
+            p.write_text(json.dumps({"destinations": []}))
+            self.assertEqual(clip_watcher.load_config(p, False).destinations, [])
+
+
+class PostDecisionTests(unittest.TestCase):
+    def test_decision(self):
+        ok = clip_watcher.PostResult("A", True)
+        bad = clip_watcher.PostResult("Friends #clips", False, "Discord said no (HTTP 404)")
+        self.assertTrue(clip_watcher.all_posted([ok, ok]))
+        self.assertFalse(clip_watcher.all_posted([ok, bad]))
+        self.assertFalse(clip_watcher.all_posted([]))
+        self.assertIsNone(clip_watcher.failure_notice([ok]))
+        title, msg = clip_watcher.failure_notice([ok, bad])
+        self.assertEqual(title, "Clip not posted everywhere")
+        self.assertEqual(msg, "Not posted to Friends #clips: Discord said no (HTTP 404).")
+
+
+class QualityTests(unittest.TestCase):
+    def test_low_quality(self):
+        f = app.is_low_quality
+        self.assertFalse(f(30, 10, 720))
+        self.assertTrue(f(90, 10, 720))
+        self.assertTrue(f(30, 10, 1080))
+        self.assertFalse(f(30, 50, 1080))
+        self.assertEqual(app.min_good_video_kbps(720), 1500)
+        self.assertEqual(app.min_good_video_kbps(1080), 3000)
+        self.assertGreater(app.min_good_video_kbps(900), 1500)
+        self.assertLess(app.min_good_video_kbps(900), 3000)
+
+    def test_custom_option(self):
+        opts = app.with_custom(app.CLIP_SECONDS_CHOICES, 25, " seconds")
+        self.assertEqual(opts[-1], ("25 seconds (custom)", 25))
+        self.assertEqual(app.with_custom(app.CLIP_SECONDS_CHOICES, 30.0, " seconds"), app.CLIP_SECONDS_CHOICES)
+
+
+class ValidateDestinationTests(unittest.TestCase):
+    def test_rules(self):
+        v = app.validate_destination
+        url = "https://discord.com/api/webhooks/1/abc"
+        self.assertIsNone(v("  Friends  ", url, []))
+        self.assertIn("name", v("   ", url, []).lower())
+        self.assertIsNone(v("x" * 40, url, []))
+        self.assertIsNotNone(v("x" * 41, url, []))
+        self.assertIsNotNone(v("A", "https://example.com/x", []))
+        self.assertEqual(v("A", url, [url]), "That webhook is already in your list.")
+        self.assertEqual(v("A", url + " ", [url]), "That webhook is already in your list.")
+
+
+class MergeConfigTests(unittest.TestCase):
+    def test_new_keys_and_migration(self):
+        old = {"webhook_url": "https://discord.com/api/webhooks/1/a", "custom": [1], "watch_dir": "V"}
+        m = app.merge_config(old, [DEST_A, clip_watcher.Destination("Off", DEST_B.url, False)], True,
+                             player_name=" Oscar ", clip_seconds=60, max_upload_mb=50, height=1080, fps=30)
+        self.assertNotIn("webhook_url", m)
+        self.assertEqual(m["destinations"], [
+            {"name": DEST_A.name, "url": DEST_A.url, "enabled": True},
+            {"name": "Off", "url": DEST_B.url, "enabled": False}])
+        self.assertEqual(m["player_name"], "Oscar")
+        self.assertEqual((m["clip_seconds"], m["max_upload_mb"], m["height"], m["fps"]), (60, 50, 1080, 30))
+        self.assertEqual(m["custom"], [1])
+        self.assertEqual(m["watch_dir"], "V")
+        self.assertIn("webhook_url", old)  # input untouched
+        # unset clips values keep what the file had
+        m2 = app.merge_config({"clip_seconds": 25}, [DEST_A], True)
+        self.assertEqual(m2["clip_seconds"], 25)
+        self.assertNotIn("height", m2)
+
+    def test_save_destinations_only(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "config.json"
+            p.write_text(json.dumps({"webhook_url": DEST_A.url, "clip_seconds": 25, "x": 1}))
+            app.save_destinations(p, [clip_watcher.Destination("My server", DEST_A.url, False)])
+            data = json.loads(p.read_text())
+            self.assertNotIn("webhook_url", data)
+            self.assertEqual((data["clip_seconds"], data["x"]), (25, 1))
+            self.assertEqual(data["destinations"][0]["enabled"], False)
+            self.assertTrue(app.has_destinations(p))
+
+
+class MockWebhook(http.server.BaseHTTPRequestHandler):
+    """Per-server script: `codes` is the list of status codes for successive requests (last repeats)."""
+    server_version = "Mock"
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        srv = self.server
+        body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        with srv.lock:
+            code = srv.codes[min(srv.requests, len(srv.codes) - 1)]
+            srv.requests += 1
+            if code == 200:
+                if "multipart" in self.headers.get("Content-Type", ""):
+                    body = re.search(rb'name="payload_json".*?\r\n\r\n(.*?)\r\n--', body, re.S).group(1)
+                srv.posts.append(json.loads(body))
+        payload = (b'{"id":"1","attachments":[{"id":"2"}]}' if code == 200
+                   else b'{"message":"Unknown Webhook"}' if code == 404 else b"")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+
+def start_mock(*codes):
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), MockWebhook)
+    srv.codes, srv.requests, srv.posts, srv.lock = list(codes), 0, [], threading.Lock()
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    srv.url = f"http://127.0.0.1:{srv.server_port}/api/webhooks/1/SECRETTOKEN"
+    return srv
+
+
+class MultiDestinationPostTests(unittest.TestCase):
+    def setUp(self):
+        self.tools = clip_watcher.find_ffmpeg(None)
+        if self.tools is None or not SYNTH_CLIP.is_file():
+            self.skipTest("ffmpeg or the synthetic clip is not available")
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        self.src = self.dir / SYNTH_CLIP.name
+        shutil.copyfile(SYNTH_CLIP, self.src)
+        self.servers = []
+        for patcher in (mock.patch.object(clip_watcher, "TMP_DIR", self.dir / "tmp"),
+                        mock.patch.object(clip_watcher, "webhook_is_valid", return_value=True),
+                        mock.patch.object(clip_watcher, "RETRY_WAITS", (0.01, 0.01, 0.01))):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.notify = mock.patch.object(clip_watcher, "notify").start()
+        self.addCleanup(mock.patch.stopall)
+
+    def _server(self, *codes):
+        srv = start_mock(*codes)
+        self.servers.append(srv)
+        self.addCleanup(srv.shutdown)
+        return srv
+
+    def _run(self, dests, **kw):
+        cfg = clip_watcher.Config(watch_dir=str(self.dir), clip_seconds=5, height=360, fps=30,
+                                  player_name="Oscar", delete_original_after_upload=True,
+                                  destinations=[{"name": n, "url": u, "enabled": e} for n, u, e in dests], **kw)
+        return clip_watcher.process_clip(cfg, self.tools, self.src, dry_run=False)
+
+    def test_all_succeed_and_original_deleted(self):
+        a, b = self._server(200), self._server(200)
+        self.assertTrue(self._run([("A", a.url, True), ("B", b.url, True)]))
+        for srv in (a, b):
+            self.assertEqual(srv.requests, 1)
+            self.assertEqual(srv.posts[0]["username"], "Oscar")
+            self.assertEqual(srv.posts[0]["allowed_mentions"], {"parse": []})
+        self.assertFalse(self.src.exists())
+        self.notify.assert_not_called()
+
+    def test_one_fails_other_still_posted_original_kept(self):
+        bad, good = self._server(404), self._server(200)
+        self.assertFalse(self._run([("Friends #clips", bad.url, True), ("Work", good.url, True)]))
+        self.assertEqual(good.requests, 1)
+        self.assertEqual(len(good.posts), 1)
+        self.assertEqual(bad.requests, 1)
+        self.assertTrue(self.src.exists())
+        self.notify.assert_called_once()
+        title, msg = self.notify.call_args.args
+        self.assertEqual(title, "Clip not posted everywhere")
+        self.assertIn("Friends #clips", msg)
+        self.assertIn("404", msg)
+        self.assertNotIn("Work", msg)
+        for secret in ("SECRETTOKEN", "127.0.0.1", "http"):
+            self.assertNotIn(secret, msg)
+
+    def test_retry_does_not_repost_elsewhere(self):
+        flaky, steady = self._server(503, 200), self._server(200)
+        self.assertTrue(self._run([("A", flaky.url, True), ("B", steady.url, True)]))
+        self.assertEqual(flaky.requests, 2)
+        self.assertEqual(len(flaky.posts), 1)
+        self.assertEqual((steady.requests, len(steady.posts)), (1, 1))
+        self.assertFalse(self.src.exists())
+
+    def test_disabled_destination_gets_nothing(self):
+        on, off = self._server(200), self._server(200)
+        self.assertTrue(self._run([("On", on.url, True), ("Off", off.url, False)]))
+        self.assertEqual(on.requests, 1)
+        self.assertEqual(off.requests, 0)
+
+    def test_too_large_reencodes_once_for_everyone(self):
+        big, other = self._server(413, 200), self._server(200)
+        with mock.patch.object(clip_watcher, "encode", wraps=clip_watcher.encode) as enc:
+            self.assertTrue(self._run([("A", big.url, True), ("B", other.url, True)]))
+        self.assertEqual(enc.call_count, 2)  # first encode + one re-encode
+        self.assertEqual((len(big.posts), len(other.posts)), (1, 1))
+
+    def test_script_mode_old_config_dry_run(self):
+        # an old config with only webhook_url still loads and counts as one enabled destination
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "c.json"
+            p.write_text(json.dumps({"webhook_url": DEST_A.url}))
+            cfg = clip_watcher.load_config(p, False)
+            self.assertEqual(len(clip_watcher.enabled_destinations(cfg)), 1)
+
+
+class TrayAndStatusTests(unittest.TestCase):
+    def _app(self, d):
+        return app.App(app.Paths(Path(d)))
+
+    def test_status_priority(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = self._app(d)
+            a.state = "downloading"
+            a.paused.set()
+            self.assertEqual(a.status_text, "Downloading video tools…")
+            a.state = "setup"
+            self.assertEqual(a.status_text, "Needs setup")
+            a.state = "idle"
+            self.assertEqual(a.status_text, "Paused")
+            a.paused.clear()
+            self.assertEqual(a.status_text, "Not posting: no destinations on")
+            a.state = "running"
+            self.assertEqual(a.status_text, "Running")
+
+    def test_post_to_items(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = self._app(d)
+            items = list(a._post_to_items())
+            self.assertEqual([i.text for i in items], ["No destinations"])
+            self.assertFalse(items[0].enabled)
+            a.destinations = (DEST_A, clip_watcher.Destination("Off & on", DEST_B.url, False))
+            items = list(a._post_to_items())
+            self.assertEqual([i.checked for i in items], [True, False])
+            self.assertEqual(items[1].text, "Off && on")
+
+    def test_toggle_saves_and_restarts(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = self._app(d)
+            a.paths.config.write_text(json.dumps({"webhook_url": DEST_A.url, "keep": 1}))
+            with mock.patch.object(app.App, "prepare_and_start") as prep:
+                a.toggle_destination(DEST_A.url)
+            prep.assert_called_once()
+            data = json.loads(a.paths.config.read_text())
+            self.assertEqual(data["destinations"], [{"name": "My server", "url": DEST_A.url, "enabled": False}])
+            self.assertNotIn("webhook_url", data)
+            self.assertEqual(data["keep"], 1)
+            self.assertFalse(a.destinations[0].enabled)
+
+    def test_nothing_enabled_means_no_watcher(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = self._app(d)
+            a.paths.config.write_text(json.dumps({"destinations": [
+                {"name": "A", "url": DEST_A.url, "enabled": False}], "watch_dir": d}))
+            with mock.patch.object(app, "find_tools", return_value=(Path("a"), Path("b"))), \
+                    mock.patch.object(clip_watcher, "watch") as watch:
+                a.start_watcher()
+            watch.assert_not_called()
+            self.assertEqual(a.state, "idle")
+            self.assertIsNone(a.watcher_thread)
+
+
+class SettingsTabsTests(unittest.TestCase):
+    def _open(self, config=None):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        env = mock.patch.dict(os.environ, {app.HOME_ENV: self._tmp.name})
+        env.start()
+        self.addCleanup(env.stop)
+        for name, rv in (("nvidia_detected", True), ("medal_detected", False)):
+            p = mock.patch.object(app, name, return_value=rv)
+            p.start()
+            self.addCleanup(p.stop)
+        if config is not None:
+            app.default_paths().config.write_text(json.dumps(config))
+        a = app.App(app.default_paths())
+        try:
+            a.create_root()
+        except Exception as e:  # noqa: BLE001
+            self.skipTest(f"Tk unavailable: {e}")
+        a.window = app.SettingsWindow(a)
+        for _ in range(3):
+            a.root.update()
+
+        def close():
+            a.root.destroy()
+            a.window = None
+            a.root = None
+            gc.collect()
+        self.addCleanup(close)
+        return a
+
+    def test_tabs_and_empty_list(self):
+        a = self._open()
+        w = a.window
+        self.assertEqual([w.nb.tab(t, "text") for t in w.nb.tabs()], ["Setup", "Clips"])
+        self.assertEqual(w.empty_label.cget("text"), "No destinations yet. Add one to start posting.")
+        self.assertEqual(w.empty_label.winfo_manager(), "pack")
+        self.assertEqual(w.dest_holder.winfo_manager(), "")
+        self.assertIn("Leave empty", w.name_help.cget("text"))
+
+    def test_save_needs_a_destination(self):
+        a = self._open()
+        w = a.window
+        w.on_save()
+        self.assertEqual(w.msg_var.get(), "Add at least one destination.")
+        self.assertFalse(app.default_paths().config.exists())
+
+    def test_invalid_name_blocks_save(self):
+        a = self._open({"destinations": [{"name": "A", "url": DEST_A.url, "enabled": True}]})
+        w = a.window
+        self.assertEqual(len(w.destinations), 1)
+        w.name_var.set("Discord Dad")
+        a.root.update()
+        self.assertTrue(w.name_error_var.get())
+        self.assertEqual(w.name_error_label.winfo_manager(), "pack")
+        self.assertEqual(str(w.save_btn.cget("state")), "disabled")
+        before = app.default_paths().config.read_text()
+        with mock.patch.object(app.App, "prepare_and_start") as prep:
+            w.on_save()
+        prep.assert_not_called()
+        self.assertEqual(app.default_paths().config.read_text(), before)
+        w.name_var.set("Oscar")
+        a.root.update()
+        self.assertEqual(w.name_error_var.get(), "")
+        self.assertEqual(str(w.save_btn.cget("state")), "normal")
+
+    def test_duplicate_url_rejected_by_dialog_validation(self):
+        a = self._open({"webhook_url": DEST_A.url})
+        w = a.window
+        self.assertEqual([d.name for d in w.destinations], ["My server"])
+        urls = [d.url for d in w.destinations]
+        self.assertEqual(app.validate_destination("Other", DEST_A.url, urls),
+                         "That webhook is already in your list.")
+        self.assertIsNone(app.validate_destination("Other", DEST_B.url, urls))
+
+    def test_custom_value_shown_and_kept(self):
+        a = self._open({"webhook_url": DEST_A.url, "clip_seconds": 25, "max_upload_mb": 50,
+                        "height": 1080, "fps": 30})
+        w = a.window
+        self.assertEqual(w.clip_vars["clip_seconds"].get(), "25 seconds (custom)")
+        self.assertEqual(w.clip_vars["max_upload_mb"].get(), "Level 2 (50 MB)")
+        self.assertEqual(w.clip_vars["height"].get(), "1080p")
+        self.assertEqual(w.clip_vars["fps"].get(), "30 fps")
+        self.assertIn("(custom)", w.clip_boxes["clip_seconds"].cget("values")[-1])
+        with mock.patch.object(app.App, "prepare_and_start"), mock.patch.object(app, "set_autostart"):
+            w.on_save()
+        data = json.loads(app.default_paths().config.read_text())
+        self.assertEqual((data["clip_seconds"], data["max_upload_mb"], data["height"], data["fps"]),
+                         (25, 50, 1080, 30))
+        self.assertNotIn("webhook_url", data)
+        self.assertEqual(data["destinations"][0]["name"], "My server")
+
+    def test_quality_warning_follows_choices(self):
+        a = self._open({"webhook_url": DEST_A.url})
+        w = a.window
+        self.assertEqual(w.quality_label.winfo_manager(), "")
+        w.clip_vars["clip_seconds"].set("90 seconds")
+        w._update_quality_warning()
+        self.assertEqual(w.quality_label.winfo_manager(), "pack")
+        self.assertEqual(w.quality_label.cget("text"),
+                         "Low quality at this length and size. A higher boost level helps.")
+        w.clip_vars["max_upload_mb"].set("Level 3 (100 MB)")
+        w._update_quality_warning()
+        self.assertEqual(w.quality_label.winfo_manager(), "")
+
+    def test_many_destinations_scroll(self):
+        dests = [{"name": f"D{i}", "url": f"https://discord.com/api/webhooks/{i}/t", "enabled": True}
+                 for i in range(1, 8)]
+        a = self._open({"destinations": dests})
+        w = a.window
+        self.assertEqual(w.dest_scroll.winfo_manager(), "pack")
+        self.assertEqual(len(w.dest_inner.winfo_children()), 7)
+        tall = w.top.winfo_reqheight()
+        w.destinations[:] = w.destinations[:2]
+        w._rebuild_destinations()
+        self.assertEqual(w.dest_scroll.winfo_manager(), "")
+        self.assertLess(w.top.winfo_reqheight(), tall)
+
+    def test_test_button_sends_name_and_reports_inline(self):
+        srv = start_mock(200)
+        self.addCleanup(srv.shutdown)
+        a = self._open({"destinations": [{"name": "Chan", "url": DEST_A.url, "enabled": True}]})
+        w = a.window
+        w.destinations[0] = clip_watcher.Destination("Chan", srv.url, True)
+        w.name_var.set("Oscar")
+        w.on_test_destination(0)
+        deadline = time.time() + 5
+        while time.time() < deadline and not srv.posts:
+            time.sleep(0.05)
+        for _ in range(20):
+            a.root.update()
+            time.sleep(0.02)
+        self.assertEqual(srv.posts[0]["username"], "Oscar")
+        self.assertTrue(w.msg_var.get().startswith("Chan: "))
+        self.assertIn("Test message sent", w.msg_var.get())
 
 
 if __name__ == "__main__":

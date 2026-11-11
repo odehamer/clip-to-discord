@@ -67,7 +67,9 @@ class TooLargeError(Exception):
 
 @dataclass
 class Config:
-    webhook_url: str = ""
+    webhook_url: str = ""          # old single-webhook key; see get_destinations
+    destinations: list | None = None   # None = key absent; a list (even empty) is authoritative
+    player_name: str = ""
     watch_dir: str = ""
     clip_seconds: float = 30
     max_upload_mb: float = 10
@@ -93,12 +95,115 @@ class Source:
     delete_original: bool
 
 
+@dataclass(frozen=True)
+class Destination:
+    """One Discord channel clips are posted to: a name, its webhook URL and an on/off state."""
+    name: str
+    url: str
+    enabled: bool = True
+
+
+@dataclass(frozen=True)
+class PostResult:
+    """What happened when posting one clip to one destination."""
+    name: str
+    ok: bool
+    reason: str = ""
+
+
+class UploadError(ClipError):
+    """A post failed; `reason` is a short, URL-free explanation for the user."""
+
+    def __init__(self, message: str, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
 # --------------------------------------------------------------------------
 # Pure logic
 # --------------------------------------------------------------------------
 
 def webhook_is_valid(url: str) -> bool:
     return bool(url) and PLACEHOLDER_MARKER not in url and url.startswith(WEBHOOK_PREFIXES)
+
+
+PLAYER_NAME_MAX = 32
+_BANNED_NAME_PARTS = ("discord", "clyde")
+
+
+def validate_player_name(name: str) -> str | None:
+    """A short user-facing error, or None when the player name is acceptable (empty is fine)."""
+    name = (name or "").strip()
+    if len(name) > PLAYER_NAME_MAX:
+        return f"Keep your name to {PLAYER_NAME_MAX} characters or fewer."
+    lowered = name.lower()
+    if any(part in lowered for part in _BANNED_NAME_PARTS):
+        return 'Discord does not allow names that contain "discord" or "clyde".'
+    return None
+
+
+def effective_player_name(cfg: "Config") -> str:
+    """The player name to send, or "" when empty or one Discord would reject."""
+    name = str(cfg.player_name or "").strip()
+    if name and validate_player_name(name):
+        log.warning("player_name is not allowed by Discord; posting under the webhook's name")
+        return ""
+    return name
+
+
+def build_payload(content: str, player_name: str = "") -> dict:
+    """The Discord JSON payload: never pings anyone; `username` only when a name is set."""
+    payload: dict = {"content": content, "allowed_mentions": {"parse": []}}
+    name = (player_name or "").strip()
+    if name:
+        payload["username"] = name
+    return payload
+
+
+def get_destinations(cfg: "Config | dict") -> list[Destination]:
+    """Destinations from a Config (or raw config dict).
+
+    A `destinations` list is authoritative (even when empty); entries with an invalid URL are
+    dropped. Without the key, a valid old-style `webhook_url` becomes one "My server" destination.
+    """
+    if isinstance(cfg, dict):
+        raw, legacy = cfg.get("destinations"), cfg.get("webhook_url", "")
+    else:
+        raw, legacy = cfg.destinations, cfg.webhook_url
+    if isinstance(raw, list):
+        out: list[Destination] = []
+        for i, item in enumerate(raw, 1):
+            if not isinstance(item, dict):
+                log.warning("Ignoring destination %d: not a valid entry", i)
+                continue
+            name = str(item.get("name") or "").strip() or f"Destination {i}"
+            url = str(item.get("url") or "").strip()
+            if not webhook_is_valid(url):
+                log.warning("Ignoring destination %r: it has no valid Discord webhook URL", name)
+                continue
+            out.append(Destination(name, url, bool(item.get("enabled", True))))
+        return out
+    legacy = str(legacy or "").strip()
+    return [Destination("My server", legacy, True)] if webhook_is_valid(legacy) else []
+
+
+def enabled_destinations(cfg: "Config | dict") -> list[Destination]:
+    return [d for d in get_destinations(cfg) if d.enabled]
+
+
+def all_posted(results: list[PostResult]) -> bool:
+    """True only when there was something to post to and every destination succeeded."""
+    return bool(results) and all(r.ok for r in results)
+
+
+def failure_notice(results: list[PostResult]) -> tuple[str, str] | None:
+    """(title, message) for the one notification about failed destinations, or None."""
+    failed = [r for r in results if not r.ok]
+    if not failed:
+        return None
+    parts = [f"Not posted to {r.name}: {(r.reason or 'unknown problem').rstrip('. ')}."
+             for r in failed]
+    return "Clip not posted everywhere", " ".join(parts)
 
 
 def compute_video_kbps(length: float, max_upload_mb: float, audio_kbps: int) -> int:
@@ -390,9 +495,9 @@ def open_url(req: urllib.request.Request, timeout: float):
     return urllib.request.urlopen(req, timeout=timeout)
 
 
-def post_text(webhook_url: str, text: str) -> None:
+def post_text(webhook_url: str, text: str, username: str = "") -> None:
     """Post a plain text message. Raises ClipError (never containing the URL) on failure."""
-    body = json.dumps({"content": text, "allowed_mentions": {"parse": []}}).encode("utf-8")
+    body = json.dumps(build_payload(text, username)).encode("utf-8")
     req = urllib.request.Request(
         webhook_url + "?wait=true", data=body, method="POST",
         headers={"Content-Type": "application/json", "User-Agent": "clip-to-discord/1.0"})
@@ -459,9 +564,12 @@ def upload(url: str, body: bytes, content_type: str) -> None:
                 log.warning("upload failed (%s), retry %d in %ds", err, net_retries, wait)
                 time.sleep(wait)
                 continue
-            raise ClipError(f"upload failed after retries ({err})")
+            reason = ("Could not reach Discord" if status == 0
+                      else f"Discord kept failing (HTTP {status})")
+            raise UploadError(f"upload failed after retries ({err})", reason)
         detail = data.get("message", "")
-        raise ClipError(f"upload rejected: HTTP {status} {detail}".strip())
+        raise UploadError(f"upload rejected: HTTP {status} {detail}".strip(),
+                          f"Discord said no (HTTP {status})")
 
 
 # --------------------------------------------------------------------------
@@ -516,28 +624,45 @@ def process_clip(cfg: Config, tools: tuple[Path, Path], src: Path, dry_run: bool
                 print(msg)
             return True
 
+        dests = enabled_destinations(cfg)
+        if not dests:
+            raise ClipError("no destination is switched on")
         fname = upload_filename(game, src)
-        payload = json.dumps({"content": f"**{game}**", "allowed_mentions": {"parse": []}})
-        shrunk = False
-        while True:
-            body, ctype = build_multipart(payload, fname, out.read_bytes())
-            try:
-                upload(cfg.webhook_url, body, ctype)
-                break
-            except TooLargeError:
-                if shrunk:
-                    raise ClipError("Discord rejected the upload as too large (even after re-encode)")
-                shrunk = True
-                log.warning("Discord says too large; re-encoding at 0.7x bitrate")
-                encoder = encode(tools, src, out, start, length, height, cfg,
-                                 int(kbps * 0.7), encoder)
+        payload = json.dumps(build_payload(f"**{game}**", effective_player_name(cfg)))
+        results: list[PostResult] = []
+        shrunk = False  # at most one re-encode per clip; later destinations get the smaller file
+        for dest in dests:
+            reason = ""
+            while True:
+                body, ctype = build_multipart(payload, fname, out.read_bytes())
+                try:
+                    upload(dest.url, body, ctype)
+                    break
+                except TooLargeError:
+                    if shrunk:
+                        reason = "Discord said the clip is too large"
+                        break
+                    shrunk = True
+                    log.warning("Discord says too large; re-encoding at 0.7x bitrate")
+                    encoder = encode(tools, src, out, start, length, height, cfg,
+                                     int(kbps * 0.7), encoder)
+                except ClipError as e:
+                    reason = getattr(e, "reason", "") or str(e) or "unknown problem"
+                    break
+            results.append(PostResult(dest.name, not reason, reason))
+            log.info("Post to %s: %s", dest.name, "ok" if not reason else f"failed ({reason})")
 
         src_size, up_size = src.stat().st_size, out.stat().st_size
         remove_quietly(out)
+        if not all_posted(results):
+            log.error("Clip %s was not posted everywhere; the original is kept", src.name)
+            notify(*failure_notice(results))
+            return False
         if should_delete_original(cfg, source):
             os.remove(src)
-        log.info("Uploaded %s game=%s source=%.1fMB upload=%.1fMB took=%.0fs",
-                 source_name, game, src_size / 1048576, up_size / 1048576, time.time() - t0)
+        log.info("Uploaded %s game=%s source=%.1fMB upload=%.1fMB destinations=%d took=%.0fs",
+                 source_name, game, src_size / 1048576, up_size / 1048576, len(results),
+                 time.time() - t0)
         return True
     except Exception as e:  # noqa: BLE001 - per-clip isolation
         log.exception("Failed to process %s: %s", src, e)
@@ -682,8 +807,9 @@ def main() -> int:
         cfg = load_config(Path(args.config) if args.config else None, args.dry_run)
     except ClipError as e:
         return fail(str(e))
-    if not args.dry_run and not webhook_is_valid(cfg.webhook_url):
-        return fail("webhook_url is missing, a placeholder, or not a Discord webhook URL")
+    if not args.dry_run and not enabled_destinations(cfg):
+        return fail("no destination is switched on: add an enabled entry with a Discord webhook "
+                    "URL to destinations (or set webhook_url) in the config file")
     tools = find_ffmpeg(cfg.ffmpeg_path)
     if tools is None:
         return fail("ffmpeg/ffprobe not found (set ffmpeg_path in config.json)")

@@ -47,6 +47,7 @@ RUN_VALUE = "ClipToDiscord"
 FFMPEG_ZIP_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 FFMPEG_SHA_URL = FFMPEG_ZIP_URL + ".sha256"
 UPDATE_INTERVAL_S = 24 * 3600
+DESTINATION_NAME_MAX = 40
 CREATE_NO_WINDOW = 0x08000000
 DETACHED_PROCESS = 0x00000008
 CREATE_NEW_PROCESS_GROUP = 0x00000200
@@ -140,17 +141,85 @@ def select_zip_members(names: list[str]) -> dict[str, str]:
     return chosen
 
 
-def merge_config(existing: dict, webhook_url: str, delete_original: bool,
+def destinations_to_json(destinations) -> list[dict]:
+    return [{"name": d.name, "url": d.url, "enabled": bool(d.enabled)} for d in destinations]
+
+
+def merge_config(existing: dict, destinations, delete_original: bool,
                  nvidia_enabled: bool = True, medal_enabled: bool = False,
-                 medal_dir: str = "") -> dict:
-    """Return existing config with the app-controlled keys set; other keys are kept."""
+                 medal_dir: str = "", player_name: str = "",
+                 clip_seconds: float | None = None, max_upload_mb: float | None = None,
+                 height: int | None = None, fps: int | None = None) -> dict:
+    """Return existing config with the app-controlled keys set; other keys are kept.
+
+    `destinations` (Destination objects) replaces the old `webhook_url` key, which is removed.
+    A Clips-tab value left as None keeps whatever the file already holds.
+    """
     merged = dict(existing)
-    merged["webhook_url"] = webhook_url
+    merged.pop("webhook_url", None)
+    merged["destinations"] = destinations_to_json(destinations)
+    merged["player_name"] = str(player_name).strip()
     merged["delete_original_after_upload"] = bool(delete_original)
     merged["nvidia_enabled"] = bool(nvidia_enabled)
     merged["medal_enabled"] = bool(medal_enabled)
     merged["medal_dir"] = str(medal_dir)
+    for key, value in (("clip_seconds", clip_seconds), ("max_upload_mb", max_upload_mb),
+                       ("height", height), ("fps", fps)):
+        if value is not None:
+            merged[key] = value
     return merged
+
+
+# -- Clips tab ---------------------------------------------------------------
+
+CLIP_SECONDS_CHOICES = [(f"{n} seconds", n) for n in (15, 30, 60, 90)]
+BOOST_CHOICES = [("None (10 MB)", 10), ("Level 2 (50 MB)", 50), ("Level 3 (100 MB)", 100)]
+HEIGHT_CHOICES = [("720p", 720), ("1080p", 1080)]
+FPS_CHOICES = [("30 fps", 30), ("60 fps", 60)]
+LOW_QUALITY_TEXT = "Low quality at this length and size. A higher boost level helps."
+
+
+def _tidy_number(value) -> float | int:
+    value = float(value)
+    return int(value) if value == int(value) else value
+
+
+def with_custom(choices: list[tuple[str, float]], current, unit: str) -> list[tuple[str, float]]:
+    """The choices plus, when `current` is not one of them, an extra '(custom)' option."""
+    try:
+        cur = _tidy_number(current)
+    except (TypeError, ValueError, OverflowError):
+        return list(choices)
+    if any(value == cur for _, value in choices):
+        return list(choices)
+    return list(choices) + [(f"{cur}{unit} (custom)", cur)]
+
+
+def min_good_video_kbps(height: float) -> float:
+    """Video bitrate below which a clip looks poor: 1500 kbps at 720p, 3000 at 1080p,
+    straight line through those two points for other heights (never below 300)."""
+    return max(300.0, 1500.0 + (float(height) - 720.0) * (1500.0 / 360.0))
+
+
+def is_low_quality(clip_seconds: float, max_upload_mb: float, height: float,
+                   audio_kbps: int = clip_watcher.Config.audio_kbps) -> bool:
+    kbps = clip_watcher.compute_video_kbps(clip_seconds, max_upload_mb, audio_kbps)
+    return kbps < min_good_video_kbps(height)
+
+
+def validate_destination(name: str, url: str, other_urls) -> str | None:
+    """Inline error for the destination dialog, or None when the entry is fine."""
+    name, url = name.strip(), url.strip()
+    if not name:
+        return "Enter a name for this destination."
+    if len(name) > DESTINATION_NAME_MAX:
+        return f"Keep the name to {DESTINATION_NAME_MAX} characters or fewer."
+    if not clip_watcher.webhook_is_valid(url):
+        return ("That doesn't look like a Discord webhook URL. Copy it again from "
+                "Discord's webhook settings.")
+    if url in {str(u).strip() for u in other_urls}:
+        return "That webhook is already in your list."
+    return None
 
 
 def normalize_medal_dir(folder: str) -> str:
@@ -208,20 +277,44 @@ def load_raw_config(path: Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def save_config(path: Path, webhook_url: str, delete_original: bool,
-                nvidia_enabled: bool = True, medal_enabled: bool = False,
-                medal_dir: str = "") -> dict:
-    merged = merge_config(load_raw_config(path), webhook_url, delete_original,
-                          nvidia_enabled, medal_enabled, medal_dir)
+def _write_config(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(merged, indent=2), encoding="utf-8")
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
     os.replace(tmp, path)
+
+
+def save_config(path: Path, destinations, delete_original: bool,
+                nvidia_enabled: bool = True, medal_enabled: bool = False,
+                medal_dir: str = "", player_name: str = "",
+                clip_seconds: float | None = None, max_upload_mb: float | None = None,
+                height: int | None = None, fps: int | None = None) -> dict:
+    merged = merge_config(load_raw_config(path), destinations, delete_original,
+                          nvidia_enabled, medal_enabled, medal_dir, player_name,
+                          clip_seconds, max_upload_mb, height, fps)
+    _write_config(path, merged)
     return merged
 
 
-def has_valid_config(path: Path) -> bool:
-    return clip_watcher.webhook_is_valid(str(load_raw_config(path).get("webhook_url", "")))
+def save_destinations(path: Path, destinations) -> dict:
+    """Write only the destinations (all other keys kept; old webhook_url dropped)."""
+    data = load_raw_config(path)
+    data.pop("webhook_url", None)
+    data["destinations"] = destinations_to_json(destinations)
+    _write_config(path, data)
+    return data
+
+
+def load_destinations(path: Path) -> list[clip_watcher.Destination]:
+    return clip_watcher.get_destinations(load_raw_config(path))
+
+
+def has_destinations(path: Path) -> bool:
+    """True when the config holds at least one destination (switched on or off)."""
+    return bool(load_destinations(path))
+
+
+has_valid_config = has_destinations
 
 
 # --------------------------------------------------------------------------
@@ -587,17 +680,109 @@ def schedule_dir_removal(app_dir: Path) -> None:
 DELETE_LABEL = "Delete the original clip after it's posted. The Discord copy will be the only copy."
 NO_SOURCE_WARNING = ("Neither NVIDIA software nor Medal was found on this PC. "
                      "Install one of them to record clips.")
-INTRO = ("Save a clip in a game with NVIDIA Instant Replay or Medal, and the last 30 seconds "
-         "are posted to your Discord channel.")
+INTRO = ("Save a clip in a game with NVIDIA Instant Replay or Medal, and it is posted to the "
+         "Discord channels you choose below.")
 NVIDIA_HELP = ("In a game, press Alt+Z, turn Instant Replay on, then use your save hotkey "
                "(Alt+F10 by default).")
 MEDAL_HELP = "Clips you save with Medal are posted. Medal keeps its own copy."
 DELETE_NOTE = "Applies to NVIDIA clips. Medal clips are always kept."
 NO_SOURCE_ERROR = "Tick at least one place your clips come from."
-MEDAL_FOLDER_ERROR = ("Choose your Medal clips folder. In Medal: Settings \u2192 PC Storage shows "
+MEDAL_FOLDER_ERROR = ("Choose your Medal clips folder. In Medal: Settings → PC Storage shows "
                       "where it is; pick the Clips folder inside it.")
+NAME_HELP = "Shown as the sender of your clips. Leave empty to use the webhook's name."
+NAME_HINT = "For example: Friends #clips"
+WEBHOOK_HELP = ("In Discord: channel settings → Integrations → Webhooks → "
+                "New Webhook → Copy Webhook URL")
+NO_DESTINATIONS_TEXT = "No destinations yet. Add one to start posting."
+NO_DESTINATIONS_ERROR = "Add at least one destination."
+LENGTH_NOTE = ("NVIDIA clips can't be longer than the Instant Replay length set in the "
+               "NVIDIA overlay.")
 RUNNING_NOTE = "Clip to Discord is running. Look for the icon near the clock."
+NOT_POSTING_NOTE = ("Saved. No destinations are switched on, so nothing will be posted. "
+                    "Use the tray menu's Post to list to switch one on.")
+TEST_MESSAGE = "Clip to Discord is connected."
 WIDTH = 480
+VISIBLE_DESTINATION_ROWS = 5
+GREY, AMBER, RED, GREEN = "#666666", "#b45309", "#b91c1c", "#15803d"
+
+
+class DestinationDialog:
+    """Small modal window to add or edit one destination."""
+
+    def __init__(self, window: "SettingsWindow", other_urls, dest: clip_watcher.Destination | None):
+        tk, ttk = window.tk, window.ttk
+        self.result: clip_watcher.Destination | None = None
+        self.other_urls = list(other_urls)
+        self.enabled = dest.enabled if dest else True
+        self.top = tk.Toplevel(window.top)
+        self.top.withdraw()
+        self.top.title("Edit destination" if dest else "Add destination")
+        self.top.resizable(False, False)
+        self.top.transient(window.top)
+        self.top.protocol("WM_DELETE_WINDOW", self.cancel)
+        self.name_var = tk.StringVar(value=dest.name if dest else "")
+        self.url_var = tk.StringVar(value=dest.url if dest else "")
+        self.show_var = tk.BooleanVar(value=False)
+        self.error_var = tk.StringVar()
+
+        f = ttk.Frame(self.top, padding=16)
+        f.pack(fill="both", expand=True)
+        wrap = WIDTH - 60
+        ttk.Label(f, text="Name").pack(anchor="w")
+        self.name_entry = ttk.Entry(f, textvariable=self.name_var)
+        self.name_entry.pack(fill="x")
+        ttk.Label(f, text=NAME_HINT, foreground=GREY).pack(anchor="w", pady=(2, 10))
+        ttk.Label(f, text="Webhook URL").pack(anchor="w")
+        row = ttk.Frame(f)
+        row.pack(fill="x")
+        self.url_entry = ttk.Entry(row, textvariable=self.url_var, show="•")
+        self.url_entry.pack(side="left", fill="x", expand=True)
+        ttk.Checkbutton(row, text="Show", variable=self.show_var,
+                        command=self._toggle_show).pack(side="left", padx=(8, 0))
+        ttk.Label(f, text=WEBHOOK_HELP, foreground=GREY, wraplength=wrap,
+                  justify="left").pack(anchor="w", pady=(2, 6))
+        ttk.Label(f, textvariable=self.error_var, foreground=RED, wraplength=wrap,
+                  justify="left").pack(anchor="w")
+        buttons = ttk.Frame(f)
+        buttons.pack(fill="x", pady=(12, 0))
+        ttk.Button(buttons, text="Cancel", command=self.cancel).pack(side="right")
+        ttk.Button(buttons, text="OK", command=self.ok).pack(side="right", padx=(0, 8))
+        self.top.bind("<Return>", lambda e: self.ok())
+        self.top.bind("<Escape>", lambda e: self.cancel())
+        self.top.update_idletasks()
+        w, h = max(WIDTH - 40, self.top.winfo_reqwidth()), self.top.winfo_reqheight()
+        x = window.top.winfo_rootx() + 20
+        y = window.top.winfo_rooty() + 40
+        self.top.geometry(f"{w}x{h}+{x}+{y}")
+
+    def _toggle_show(self) -> None:
+        self.url_entry.configure(show="" if self.show_var.get() else "•")
+
+    def validate(self) -> str | None:
+        return validate_destination(self.name_var.get(), self.url_var.get(), self.other_urls)
+
+    def ok(self) -> None:
+        err = self.validate()
+        self.error_var.set(err or "")
+        if err:
+            return
+        self.result = clip_watcher.Destination(self.name_var.get().strip(),
+                                               self.url_var.get().strip(), self.enabled)
+        self.top.destroy()
+
+    def cancel(self) -> None:
+        self.top.destroy()
+
+    def run(self) -> clip_watcher.Destination | None:
+        self.top.deiconify()
+        try:
+            self.top.wait_visibility()
+            self.top.grab_set()
+        except Exception:  # noqa: BLE001 - grabbing can fail if the window closed early
+            pass
+        self.name_entry.focus_set()
+        self.top.wait_window()
+        return self.result
 
 
 class SettingsWindow:
@@ -618,22 +803,26 @@ class SettingsWindow:
             self.top.iconphoto(True, self._icon_ref)
         except Exception:  # noqa: BLE001
             pass
+        self.page_bg = ttk.Style(self.top).lookup("TFrame", "background") or self.top.cget("bg")
 
         raw = load_raw_config(app.paths.config)
-        valid = clip_watcher.webhook_is_valid(str(raw.get("webhook_url", "")))
-        self.webhook_var = tk.StringVar(value=str(raw.get("webhook_url", "")) if valid else "")
-        self.show_var = tk.BooleanVar(value=False)
-        self.autostart_var = tk.BooleanVar(value=autostart_enabled() if valid else True)
+        self.destinations: list[clip_watcher.Destination] = load_destinations(app.paths.config)
+        has_config = bool(self.destinations)
+        self.name_var = tk.StringVar(value=str(raw.get("player_name") or ""))
+        self.name_error_var = tk.StringVar()
+        self.autostart_var = tk.BooleanVar(value=autostart_enabled() if has_config else True)
         self.delete_var = tk.BooleanVar(value=bool(raw.get("delete_original_after_upload", True)))
         nvidia_found, medal_found = nvidia_detected(), medal_detected()
         self.sources_found = (nvidia_found, medal_found)
-        nv_on, md_on = initial_sources(raw, valid, nvidia_found, medal_found)
+        nv_on, md_on = initial_sources(raw, has_config, nvidia_found, medal_found)
         self.nvidia_var = tk.BooleanVar(value=nv_on)
         self.medal_var = tk.BooleanVar(value=md_on)
         self.medal_dir_var = tk.StringVar(
             value=str(raw.get("medal_dir") or "") or clip_watcher.detect_medal_dir() or "")
         self.msg_var = tk.StringVar()
         self.progress_text = tk.StringVar()
+        self.busy = False
+        self._raw = raw
         self._build()
         self.fit()
 
@@ -643,57 +832,21 @@ class SettingsWindow:
         f = ttk.Frame(self.top, padding=16)
         f.pack(fill="both", expand=True)
         ttk.Label(f, text=APP_NAME, font=("Segoe UI", 16, "bold")).pack(anchor="w")
-        ttk.Label(f, text=INTRO, wraplength=WIDTH - 40).pack(anchor="w", pady=(4, 12))
+        ttk.Label(f, text=INTRO, wraplength=WIDTH - 40).pack(anchor="w", pady=(4, 8))
 
-        box = ttk.LabelFrame(f, text="Where your clips come from", padding=10)
-        box.pack(fill="x")
-        self.nvidia_cb = ttk.Checkbutton(box, text="NVIDIA Instant Replay", variable=self.nvidia_var)
-        self.nvidia_cb.pack(anchor="w")
-        ttk.Label(box, text=NVIDIA_HELP, wraplength=WIDTH - 80, justify="left",
-                  foreground="#666666").pack(anchor="w", padx=(24, 0), pady=(0, 8))
-        self.medal_cb = ttk.Checkbutton(box, text="Medal", variable=self.medal_var,
-                                        command=self._update_medal_state)
-        self.medal_cb.pack(anchor="w")
-        ttk.Label(box, text=MEDAL_HELP, wraplength=WIDTH - 80, justify="left",
-                  foreground="#666666").pack(anchor="w", padx=(24, 0), pady=(0, 4))
-        mrow = ttk.Frame(box)
-        mrow.pack(fill="x", padx=(24, 0))
-        self.medal_label = ttk.Label(mrow, text="Medal clips folder")
-        self.medal_label.pack(side="left")
-        self.medal_entry = ttk.Entry(mrow, textvariable=self.medal_dir_var, state="readonly")
-        self.medal_entry.pack(side="left", fill="x", expand=True, padx=(8, 8))
-        self.medal_browse_btn = ttk.Button(mrow, text="Browse\u2026", command=self.on_browse_medal)
-        self.medal_browse_btn.pack(side="left")
-        self._update_medal_state()
-        if not (self.sources_found[0] or self.sources_found[1]):
-            self.warning = ttk.Label(box, text=NO_SOURCE_WARNING, wraplength=WIDTH - 60,
-                                     foreground="#b45309", justify="left")
-            self.warning.pack(anchor="w", pady=(8, 0))
+        self.nb = ttk.Notebook(f)
+        self.nb.pack(fill="x")
+        self.setup_tab = ttk.Frame(self.nb, padding=(10, 10, 10, 10))
+        self.clips_tab = ttk.Frame(self.nb, padding=(10, 10, 10, 10))
+        self.nb.add(self.setup_tab, text="Setup")
+        self.nb.add(self.clips_tab, text="Clips")
+        self._build_setup(self.setup_tab)
+        self._build_clips(self.clips_tab)
+        self.nb.bind("<<NotebookTabChanged>>", lambda e: self.fit())
 
-        ttk.Label(f, text="Discord webhook URL").pack(anchor="w", pady=(14, 2))
-        row = ttk.Frame(f)
-        row.pack(fill="x")
-        self.entry = ttk.Entry(row, textvariable=self.webhook_var, show="\u2022")
-        self.entry.pack(side="left", fill="x", expand=True)
-        ttk.Checkbutton(row, text="Show", variable=self.show_var,
-                        command=self._toggle_show).pack(side="left", padx=(8, 0))
-        ttk.Label(f, foreground="#666666", wraplength=WIDTH - 40,
-                  text="In Discord: channel settings \u2192 Integrations \u2192 Webhooks \u2192 "
-                       "New Webhook \u2192 Copy Webhook URL").pack(anchor="w", pady=(2, 6))
-        self.test_btn = ttk.Button(f, text="Send test message", command=self.on_test)
-        self.test_btn.pack(anchor="w")
         self.msg_label = tk.Label(f, textvariable=self.msg_var, wraplength=WIDTH - 40,
-                                  justify="left", anchor="w", fg="#666666")
-        self.msg_label.pack(anchor="w", fill="x", pady=(4, 0))
-
-        self.autostart_cb = tk.Checkbutton(f, text="Start with Windows", variable=self.autostart_var,
-                                           anchor="w")
-        self.autostart_cb.pack(anchor="w", pady=(10, 0))
-        self.delete_cb = tk.Checkbutton(f, text=DELETE_LABEL, variable=self.delete_var,
-                                        anchor="w", justify="left", wraplength=WIDTH - 60)
-        self.delete_cb.pack(anchor="w", fill="x")
-        tk.Label(f, text=DELETE_NOTE, anchor="w", justify="left", fg="#666666",
-                 wraplength=WIDTH - 60).pack(anchor="w", fill="x", padx=(22, 0))
+                                  justify="left", anchor="w", fg=GREY)
+        self.msg_label.pack(anchor="w", fill="x", pady=(6, 0))
 
         self.progress_frame = ttk.Frame(f)
         ttk.Label(self.progress_frame, textvariable=self.progress_text,
@@ -705,13 +858,146 @@ class SettingsWindow:
         self.progress_frame_pack = dict(fill="x", pady=(12, 0))
 
         self.buttons = ttk.Frame(f)
-        self.buttons.pack(fill="x", pady=(16, 0))
+        self.buttons.pack(fill="x", pady=(12, 0))
         self.close_btn = ttk.Button(self.buttons, text="Close", command=self.on_close)
         self.close_btn.pack(side="right")
         self.save_btn = ttk.Button(self.buttons, text="Save", command=self.on_save)
         self.save_btn.pack(side="right", padx=(0, 8))
+        self._update_save_state()
+
+    def _build_setup(self, tab) -> None:
+        tk, ttk = self.tk, self.ttk
+        wrap = WIDTH - 120
+
+        ttk.Label(tab, text="Your name").pack(anchor="w")
+        self.name_entry = ttk.Entry(tab, textvariable=self.name_var)
+        self.name_entry.pack(fill="x")
+        self.name_help = ttk.Label(tab, text=NAME_HELP, foreground=GREY, wraplength=WIDTH - 60,
+                                   justify="left")
+        self.name_help.pack(anchor="w", pady=(2, 0))
+        self.name_error_label = ttk.Label(tab, textvariable=self.name_error_var, foreground=RED,
+                                          wraplength=WIDTH - 60, justify="left")
+        self.name_var.trace_add("write", lambda *a: self._on_name_changed())
+        self._on_name_changed(fit=False)
+
+        dbox = ttk.LabelFrame(tab, text="Where clips are posted", padding=10)
+        dbox.pack(fill="x", pady=(12, 0))
+        self.add_btn = ttk.Button(dbox, text="Add destination…", command=self.on_add_destination)
+        self.add_btn.pack(anchor="w", pady=(6, 0))
+        self.empty_label = ttk.Label(dbox, text=NO_DESTINATIONS_TEXT, foreground=GREY)
+        self.dest_holder = ttk.Frame(dbox)
+        self.dest_canvas = tk.Canvas(self.dest_holder, highlightthickness=0, borderwidth=0,
+                                     bg=self.page_bg, width=100, height=1)
+        self.dest_scroll = ttk.Scrollbar(self.dest_holder, orient="vertical",
+                                         command=self.dest_canvas.yview)
+        self.dest_canvas.configure(yscrollcommand=self.dest_scroll.set)
+        self.dest_canvas.pack(side="left", fill="x", expand=True)
+        self.dest_inner = ttk.Frame(self.dest_canvas)
+        self._dest_window = self.dest_canvas.create_window((0, 0), window=self.dest_inner,
+                                                           anchor="nw")
+        self.dest_canvas.bind("<Configure>", lambda e: self.dest_canvas.itemconfigure(
+            self._dest_window, width=e.width))
+        self.dest_vars: list = []
+        self._rebuild_destinations(fit=False)
+
+        box = ttk.LabelFrame(tab, text="Where your clips come from", padding=10)
+        box.pack(fill="x", pady=(12, 0))
+        self.nvidia_cb = ttk.Checkbutton(box, text="NVIDIA Instant Replay", variable=self.nvidia_var)
+        self.nvidia_cb.pack(anchor="w")
+        ttk.Label(box, text=NVIDIA_HELP, wraplength=wrap, justify="left",
+                  foreground=GREY).pack(anchor="w", padx=(24, 0), pady=(0, 8))
+        self.medal_cb = ttk.Checkbutton(box, text="Medal", variable=self.medal_var,
+                                        command=self._update_medal_state)
+        self.medal_cb.pack(anchor="w")
+        ttk.Label(box, text=MEDAL_HELP, wraplength=wrap, justify="left",
+                  foreground=GREY).pack(anchor="w", padx=(24, 0), pady=(0, 4))
+        mrow = ttk.Frame(box)
+        mrow.pack(fill="x", padx=(24, 0))
+        self.medal_label = ttk.Label(mrow, text="Medal clips folder")
+        self.medal_label.pack(side="left")
+        self.medal_entry = ttk.Entry(mrow, textvariable=self.medal_dir_var, state="readonly")
+        self.medal_entry.pack(side="left", fill="x", expand=True, padx=(8, 8))
+        self.medal_browse_btn = ttk.Button(mrow, text="Browse…", command=self.on_browse_medal)
+        self.medal_browse_btn.pack(side="left")
+        self._update_medal_state()
+        if not (self.sources_found[0] or self.sources_found[1]):
+            self.warning = ttk.Label(box, text=NO_SOURCE_WARNING, wraplength=WIDTH - 120,
+                                     foreground=AMBER, justify="left")
+            self.warning.pack(anchor="w", pady=(8, 0))
+
+        self.autostart_cb = tk.Checkbutton(tab, text="Start with Windows", variable=self.autostart_var,
+                                           anchor="w", bg=self.page_bg, activebackground=self.page_bg)
+        self.autostart_cb.pack(anchor="w", pady=(10, 0))
+        self.delete_cb = tk.Checkbutton(tab, text=DELETE_LABEL, variable=self.delete_var,
+                                        anchor="w", justify="left", wraplength=WIDTH - 80,
+                                        bg=self.page_bg, activebackground=self.page_bg)
+        self.delete_cb.pack(anchor="w", fill="x")
+        tk.Label(tab, text=DELETE_NOTE, anchor="w", justify="left", fg=GREY, bg=self.page_bg,
+                 wraplength=WIDTH - 80).pack(anchor="w", fill="x", padx=(22, 0))
+
+    def _build_clips(self, tab) -> None:
+        ttk = self.ttk
+        defaults = clip_watcher.Config()
+        raw = self._raw
+
+        def current(key: str, default):
+            try:
+                return _tidy_number(raw.get(key, default))
+            except (TypeError, ValueError, OverflowError):
+                return _tidy_number(default)
+
+        self.clip_vars: dict = {}
+        self.clip_maps: dict = {}
+        self.clip_boxes: dict = {}
+        specs = [
+            ("clip_seconds", "Clip length", CLIP_SECONDS_CHOICES, " seconds", defaults.clip_seconds),
+            ("max_upload_mb", "Server boost level", BOOST_CHOICES, " MB", defaults.max_upload_mb),
+            ("height", "Resolution", HEIGHT_CHOICES, "p", defaults.height),
+            ("fps", "Frame rate", FPS_CHOICES, " fps", defaults.fps),
+        ]
+        grid = ttk.Frame(tab)
+        grid.pack(fill="x")
+        grid.columnconfigure(1, weight=1)
+        row = 0
+        for key, label, choices, unit, default in specs:
+            cur = current(key, default)
+            options = with_custom(choices, cur, unit)
+            mapping = dict(options)
+            var = self.tk.StringVar(value=next(lbl for lbl, val in options if val == cur))
+            ttk.Label(grid, text=label).grid(row=row, column=0, sticky="w", padx=(0, 16), pady=4)
+            box = ttk.Combobox(grid, textvariable=var, values=[lbl for lbl, _ in options],
+                               state="readonly", width=22)
+            box.grid(row=row, column=1, sticky="w", pady=4)
+            box.bind("<<ComboboxSelected>>", lambda e: self._update_quality_warning())
+            self.clip_vars[key], self.clip_maps[key], self.clip_boxes[key] = var, mapping, box
+            row += 1
+            if key == "clip_seconds":
+                ttk.Label(grid, text=LENGTH_NOTE, foreground=GREY, wraplength=WIDTH - 60,
+                          justify="left").grid(row=row, column=0, columnspan=2, sticky="w",
+                                               pady=(0, 6))
+                row += 1
+        self.quality_label = ttk.Label(tab, text=LOW_QUALITY_TEXT, foreground=AMBER,
+                                       wraplength=WIDTH - 60, justify="left")
+        self._update_quality_warning(fit=False)
+
+    def clip_values(self) -> dict:
+        return {key: self.clip_maps[key][var.get()] for key, var in self.clip_vars.items()}
+
+    def _update_quality_warning(self, fit: bool = True) -> None:
+        v = self.clip_values()
+        low = is_low_quality(v["clip_seconds"], v["max_upload_mb"], v["height"])
+        if low and not self.quality_label.winfo_manager():
+            self.quality_label.pack(anchor="w", pady=(10, 0))
+        elif not low and self.quality_label.winfo_manager():
+            self.quality_label.pack_forget()
+        if fit:
+            self.fit()
 
     def fit(self) -> None:
+        """Size the window to the width above and the height of the tab being shown."""
+        self.top.update_idletasks()
+        sel = self.nb.nametowidget(self.nb.select())
+        self.nb.configure(height=sel.winfo_reqheight())
         self.top.update_idletasks()
         self.top.geometry(f"{WIDTH}x{self.top.winfo_reqheight()}")
 
@@ -730,13 +1016,128 @@ class SettingsWindow:
         if chosen:
             self.medal_dir_var.set(normalize_medal_dir(str(Path(chosen))))
 
-    def _toggle_show(self) -> None:
-        self.entry.configure(show="" if self.show_var.get() else "\u2022")
+    # -- player name -----------------------------------------------------------
+    def _on_name_changed(self, fit: bool = True) -> None:
+        err = clip_watcher.validate_player_name(self.name_var.get())
+        self.name_error_var.set(err or "")
+        shown = bool(self.name_error_label.winfo_manager())
+        if err and not shown:
+            self.name_error_label.pack(anchor="w", after=self.name_help)
+        elif not err and shown:
+            self.name_error_label.pack_forget()
+        self._update_save_state()
+        if fit:
+            self.fit()
+
+    def _update_save_state(self) -> None:
+        if not hasattr(self, "save_btn"):
+            return
+        blocked = self.busy or bool(self.name_error_var.get())
+        self.save_btn.configure(state="disabled" if blocked else "normal")
+
+    # -- destinations ----------------------------------------------------------
+    def _rebuild_destinations(self, fit: bool = True) -> None:
+        tk, ttk = self.tk, self.ttk
+        for child in self.dest_inner.winfo_children():
+            child.destroy()
+        self.dest_vars = []
+        n = len(self.destinations)
+        self.empty_label.pack_forget()
+        self.dest_holder.pack_forget()
+        if n == 0:
+            self.empty_label.pack(anchor="w", before=self.add_btn)
+        else:
+            self.dest_holder.pack(fill="x", before=self.add_btn)
+            for i, dest in enumerate(self.destinations):
+                row = ttk.Frame(self.dest_inner)
+                row.pack(fill="x", pady=1)
+                var = tk.BooleanVar(value=dest.enabled)
+                self.dest_vars.append(var)
+                ttk.Checkbutton(row, text=dest.name, variable=var,
+                                command=lambda i=i: self._on_toggle_destination(i)
+                                ).pack(side="left", fill="x", expand=True)
+                for text, handler in (("Test", self.on_test_destination),
+                                      ("Edit…", self.on_edit_destination),
+                                      ("Remove", self.on_remove_destination)):
+                    ttk.Button(row, text=text, width=7,
+                               command=lambda h=handler, i=i: h(i)).pack(side="left", padx=(4, 0))
+            self.top.update_idletasks()
+            full = self.dest_inner.winfo_reqheight()
+            capped = min(full, int(full / n * VISIBLE_DESTINATION_ROWS))
+            self.dest_canvas.configure(height=capped, scrollregion=(0, 0, 1, full))
+            if n > VISIBLE_DESTINATION_ROWS:
+                self.dest_scroll.pack(side="right", fill="y")
+                self._bind_wheel(self.dest_canvas)
+                self._bind_wheel(self.dest_inner)
+            else:
+                self.dest_scroll.pack_forget()
+                self.dest_canvas.yview_moveto(0)
+        if fit:
+            self.fit()
+
+    def _bind_wheel(self, widget) -> None:
+        widget.bind("<MouseWheel>", lambda e: self.dest_canvas.yview_scroll(
+            int(-e.delta / 120) or (-1 if e.delta > 0 else 1), "units"))
+        for child in widget.winfo_children():
+            self._bind_wheel(child)
+
+    def _on_toggle_destination(self, index: int) -> None:
+        d = self.destinations[index]
+        self.destinations[index] = clip_watcher.Destination(d.name, d.url, bool(self.dest_vars[index].get()))
+
+    def sync_enabled(self, url: str, enabled: bool) -> None:
+        """The tray switched a destination; mirror it here without losing other edits."""
+        for i, d in enumerate(self.destinations):
+            if d.url == url and d.enabled != enabled:
+                self.destinations[i] = clip_watcher.Destination(d.name, d.url, enabled)
+        self._rebuild_destinations()
+
+    def on_add_destination(self) -> None:
+        dlg = DestinationDialog(self, [d.url for d in self.destinations], None)
+        result = dlg.run()
+        if result:
+            self.destinations.append(result)
+            self._rebuild_destinations()
+
+    def on_edit_destination(self, index: int) -> None:
+        old = self.destinations[index]
+        others = [d.url for i, d in enumerate(self.destinations) if i != index]
+        result = DestinationDialog(self, others, old).run()
+        if result:
+            self.destinations[index] = result
+            self._rebuild_destinations()
+
+    def on_remove_destination(self, index: int) -> None:
+        from tkinter import messagebox
+        name = self.destinations[index].name
+        if messagebox.askyesno(APP_NAME, f"Remove {name}? The webhook URL can't be recovered "
+                                         "from this app afterwards.", parent=self.top):
+            del self.destinations[index]
+            self._rebuild_destinations()
+
+    def on_test_destination(self, index: int) -> None:
+        dest = self.destinations[index]
+        name = self.name_var.get().strip()
+        username = name if clip_watcher.validate_player_name(name) is None else ""
+        self.set_message(f"{dest.name}: sending…")
+
+        def work() -> None:
+            try:
+                clip_watcher.post_text(dest.url, TEST_MESSAGE, username=username)
+                result = ("Test message sent. Check your channel.", "ok")
+            except clip_watcher.ClipError as e:
+                result = (str(e), "error")
+            except Exception as e:  # noqa: BLE001
+                log.exception("test message failed")
+                result = (f"Something went wrong ({type(e).__name__}).", "error")
+            self.app.later(lambda: self.set_message(f"{dest.name}: {result[0]}", result[1]))
+
+        threading.Thread(target=work, name="test-message", daemon=True).start()
 
     # -- helpers used by App ----------------------------------------------
     def set_message(self, text: str, kind: str = "info") -> None:
         self.msg_var.set(text)
-        self.msg_label.configure(fg={"ok": "#15803d", "error": "#b91c1c"}.get(kind, "#666666"))
+        self.msg_label.configure(fg={"ok": GREEN, "error": RED}.get(kind, GREY))
         self.fit()
 
     def show(self) -> None:
@@ -744,7 +1145,9 @@ class SettingsWindow:
         self.top.lift()
         self.top.attributes("-topmost", True)
         self.top.after(300, lambda: self.top.attributes("-topmost", False))
-        self.entry.focus_set()
+        if not self.destinations:
+            self.nb.select(self.setup_tab)
+        self.name_entry.focus_set()
         self.fit()
 
     def hide(self) -> None:
@@ -754,7 +1157,8 @@ class SettingsWindow:
         return self.top.state() == "normal"
 
     def set_busy(self, busy: bool) -> None:
-        self.save_btn.configure(state="disabled" if busy else "normal")
+        self.busy = busy
+        self._update_save_state()
 
     def show_progress(self, text: str, fraction: float | None = None, error: bool = False) -> None:
         if not self.progress_frame.winfo_ismapped():
@@ -781,38 +1185,6 @@ class SettingsWindow:
         self.fit()
 
     # -- actions -------------------------------------------------------------
-    def _valid_url(self) -> str | None:
-        url = self.webhook_var.get().strip()
-        if clip_watcher.webhook_is_valid(url):
-            return url
-        self.set_message("That doesn't look like a Discord webhook URL. Copy it again from "
-                         "Discord's webhook settings.", "error")
-        return None
-
-    def on_test(self) -> None:
-        url = self._valid_url()
-        if not url:
-            return
-        self.test_btn.configure(state="disabled")
-        self.set_message("Sending\u2026")
-
-        def work() -> None:
-            try:
-                clip_watcher.post_text(url, "Clip to Discord is connected.")
-                result = ("Test message sent. Check your channel.", "ok")
-            except clip_watcher.ClipError as e:
-                result = (str(e), "error")
-            except Exception as e:  # noqa: BLE001
-                log.exception("test message failed")
-                result = (f"Something went wrong ({type(e).__name__}).", "error")
-            self.app.later(lambda: self._test_done(*result))
-
-        threading.Thread(target=work, name="test-message", daemon=True).start()
-
-    def _test_done(self, text: str, kind: str) -> None:
-        self.test_btn.configure(state="normal")
-        self.set_message(text, kind)
-
     def _valid_sources(self) -> str | None:
         """Returns the Medal folder to save ('' when Medal is off), or None after showing an error."""
         if not self.nvidia_var.get() and not self.medal_var.get():
@@ -828,15 +1200,25 @@ class SettingsWindow:
         return folder
 
     def on_save(self) -> None:
+        name_error = clip_watcher.validate_player_name(self.name_var.get())
+        if name_error:
+            self.nb.select(self.setup_tab)
+            self.set_message(name_error, "error")
+            return
+        if not self.destinations:
+            self.nb.select(self.setup_tab)
+            self.set_message(NO_DESTINATIONS_ERROR, "error")
+            return
         medal_dir = self._valid_sources()
         if medal_dir is None:
+            self.nb.select(self.setup_tab)
             return
-        url = self._valid_url()
-        if not url:
-            return
+        clips = self.clip_values()
         try:
-            save_config(self.app.paths.config, url, self.delete_var.get(),
-                        self.nvidia_var.get(), self.medal_var.get(), medal_dir)
+            save_config(self.app.paths.config, self.destinations, self.delete_var.get(),
+                        self.nvidia_var.get(), self.medal_var.get(), medal_dir,
+                        self.name_var.get().strip(), clips["clip_seconds"],
+                        clips["max_upload_mb"], clips["height"], clips["fps"])
         except OSError as e:
             self.set_message(f"Could not save your settings ({e.strerror or e}).", "error")
             return
@@ -845,13 +1227,14 @@ class SettingsWindow:
         except OSError as e:
             log.error("autostart change failed: %s", e)
         self.set_message("Saved.", "ok")
+        self.app.reload_destinations()
         self.app.prepare_and_start(hide_when_ready=True)
 
     def on_retry(self) -> None:
         self.app.prepare_and_start(hide_when_ready=True)
 
     def on_close(self) -> None:
-        if has_valid_config(self.app.paths.config):
+        if has_destinations(self.app.paths.config):
             self.hide()
         else:
             self.app.quit()
@@ -868,7 +1251,8 @@ class App:
         self.control: ControlServer | None = None
         self.watcher_stop: threading.Event | None = None
         self.watcher_thread: threading.Thread | None = None
-        self.state = "setup"  # setup | downloading | running
+        self.state = "setup"  # setup | downloading | idle (no destination on) | running
+        self.destinations: tuple[clip_watcher.Destination, ...] = ()
         self.busy = False
         self.hide_when_ready = False
         self.update_tag = ""
@@ -884,13 +1268,33 @@ class App:
         self.root.title(APP_NAME)
         self.root.after(50, self._pump)
 
+    def reload_destinations(self) -> None:
+        """Re-read the destinations from the config file (the tray menu shows this copy)."""
+        self.destinations = tuple(load_destinations(self.paths.config))
+
+    def _post_to_items(self):
+        """Items of the tray's 'Post to' submenu, rebuilt from the current destinations."""
+        import pystray
+        dests = self.destinations
+        if not dests:
+            yield pystray.MenuItem("No destinations", None, enabled=False)
+            return
+        for d in dests:
+            yield pystray.MenuItem(d.name.replace("&", "&&"), self._toggle_action(d.url),
+                                   checked=lambda item, on=d.enabled: on)
+
+    def _toggle_action(self, url: str):
+        return lambda icon, item: self.later(lambda: self.toggle_destination(url))
+
     def start_tray(self) -> None:
         import pystray
+        self.reload_destinations()
         menu = pystray.Menu(
             pystray.MenuItem(lambda item: self.status_text, None, enabled=False),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Pause posting", lambda i, it: self.later(self.toggle_pause),
                              checked=lambda item: self.paused.is_set()),
+            pystray.MenuItem("Post to", pystray.Menu(self._post_to_items)),
             pystray.MenuItem("Settings\u2026", lambda i, it: self.later(self.show_settings),
                              default=True),
             pystray.MenuItem("Open log", lambda i, it: self.later(self.open_log)),
@@ -930,7 +1334,11 @@ class App:
             return "Downloading video tools\u2026"
         if self.state == "setup":
             return "Needs setup"
-        return "Paused" if self.paused.is_set() else "Running"
+        if self.paused.is_set():
+            return "Paused"
+        if self.state == "idle":
+            return "Not posting: no destinations on"
+        return "Running"
 
     def set_state(self, state: str) -> None:
         self.state = state
@@ -956,6 +1364,28 @@ class App:
         if self.window is None:
             self.window = SettingsWindow(self)
         self.window.show()
+
+    def toggle_destination(self, url: str) -> None:
+        """Tray: switch one destination on or off, save, and restart the watcher."""
+        current = list(load_destinations(self.paths.config))
+        for i, d in enumerate(current):
+            if d.url == url:
+                current[i] = clip_watcher.Destination(d.name, d.url, not d.enabled)
+                new_state = current[i].enabled
+                break
+        else:
+            return
+        try:
+            save_destinations(self.paths.config, current)
+        except OSError as e:
+            log.error("could not save destinations: %s", e)
+            self.notify(APP_NAME, "Could not save that change.")
+            return
+        self.reload_destinations()
+        if self.window is not None:
+            self.window.sync_enabled(url, new_state)
+        self.prepare_and_start()
+        self.refresh_tray()
 
     def toggle_pause(self) -> None:
         if self.paused.is_set():
@@ -1022,6 +1452,7 @@ class App:
         if self.busy:
             return
         self.hide_when_ready = hide_when_ready
+        self.reload_destinations()
         cfg = self._load_cfg()
         if cfg is None:
             self.set_state("setup")
@@ -1085,16 +1516,17 @@ class App:
         self.start_watcher()
         if self.hide_when_ready:
             self.hide_when_ready = False
-            if self.window:
-                self.window.hide()
-            self.notify(APP_NAME, RUNNING_NOTE)
+            if self.state in ("running", "idle"):
+                if self.window:
+                    self.window.hide()
+                self.notify(APP_NAME, RUNNING_NOTE if self.state == "running" else NOT_POSTING_NOTE)
 
     def _load_cfg(self) -> clip_watcher.Config | None:
         try:
             cfg = clip_watcher.load_config(self.paths.config, False)
         except clip_watcher.ClipError:
             return None
-        return cfg if clip_watcher.webhook_is_valid(cfg.webhook_url) else None
+        return cfg if clip_watcher.get_destinations(cfg) else None
 
     def stop_watcher(self) -> None:
         if self.watcher_stop is not None:
@@ -1108,6 +1540,10 @@ class App:
         tools = find_tools(self.paths, cfg.ffmpeg_path) if cfg else None
         if cfg is None or tools is None:
             self.set_state("setup")
+            return
+        if not clip_watcher.enabled_destinations(cfg):
+            log.info("no destination is switched on; not watching for clips")
+            self.set_state("idle")
             return
         sources = clip_watcher.get_sources(cfg)
         if not any(src.dir.is_dir() for src in sources):
@@ -1152,7 +1588,7 @@ class App:
         self.create_root()
         self.start_tray()
         threading.Thread(target=self.update_loop, name="updates", daemon=True).start()
-        if has_valid_config(self.paths.config):
+        if has_destinations(self.paths.config):
             self.prepare_and_start()
         else:
             self.show_settings()
