@@ -606,7 +606,7 @@ class MedalConfigTests(unittest.TestCase):
                          (False, True))
 
     def test_version(self):
-        self.assertEqual(app.__version__, "1.2.0")
+        self.assertEqual(app.__version__, "1.2.1")
 
 
 class SourceWindowTests(unittest.TestCase):
@@ -1135,6 +1135,23 @@ class SettingsTabsTests(unittest.TestCase):
         self.assertEqual(srv.posts[0]["username"], "Oscar")
         self.assertTrue(w.msg_var.get().startswith("Chan: "))
         self.assertIn("Test message sent", w.msg_var.get())
+
+
+class NoDowngradeTests(unittest.TestCase):
+    def test_defer_only_to_a_newer_install(self):
+        self.assertTrue(app.defer_to_installed("1.3.0", "1.2.1"))
+        self.assertTrue(app.defer_to_installed("1.2.10", "1.2.9"))
+        self.assertFalse(app.defer_to_installed("1.2.1", "1.2.1"))
+        self.assertFalse(app.defer_to_installed("1.0.0", "1.2.1"))
+        self.assertFalse(app.defer_to_installed("", "1.2.1"))
+        self.assertFalse(app.defer_to_installed("garbage", "1.2.1"))
+
+    def test_version_file_roundtrip(self):
+        with tempfile.TemporaryDirectory() as d:
+            paths = app.Paths(Path(d))
+            self.assertEqual(app.read_installed_version(paths), "")
+            app.write_installed_version(paths)
+            self.assertEqual(app.read_installed_version(paths), app.__version__)
 
 
 if __name__ == "__main__":

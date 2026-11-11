@@ -33,7 +33,7 @@ from PIL import Image, ImageDraw
 
 import clip_watcher
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 APP_NAME = "Clip to Discord"
 REPO = "odehamer/clip-to-discord"
 
@@ -83,6 +83,10 @@ class Paths:
     @property
     def exe(self) -> Path:
         return self.app_dir / "ClipToDiscord.exe"
+
+    @property
+    def version_file(self) -> Path:
+        return self.app_dir / "version.txt"
 
 
 def default_paths() -> Paths:
@@ -615,6 +619,26 @@ def _spawn_detached(args: list[str] | str, **kw) -> None:
     env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1")
     subprocess.Popen(args, env=env, close_fds=True, stdin=subprocess.DEVNULL,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kw)
+
+
+def read_installed_version(paths: Paths) -> str:
+    """The version the installed copy recorded when it last ran, or "" if unknown."""
+    try:
+        return paths.version_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def write_installed_version(paths: Paths) -> None:
+    try:
+        paths.version_file.write_text(__version__, encoding="utf-8")
+    except OSError as e:
+        log.warning("could not record the installed version: %s", e)
+
+
+def defer_to_installed(installed: str, current: str) -> bool:
+    """True when the installed copy is newer than this one, so this copy must not replace it."""
+    return bool(installed) and is_newer(installed, current)
 
 
 def same_file(a: Path, b: Path) -> bool:
@@ -1624,9 +1648,17 @@ def main(argv: list[str] | None = None) -> int:
                 same = Path(sys.executable).resolve() == paths.exe.resolve()
             except OSError:
                 same = False
-            if not same and same_file(Path(sys.executable), paths.exe):
-                # The same version is already installed: open its Settings window
-                # instead of replacing and silently restarting it.
+            if same:
+                write_installed_version(paths)
+            installed = read_installed_version(paths)
+            if not same and paths.exe.is_file() and (
+                    same_file(Path(sys.executable), paths.exe)
+                    or defer_to_installed(installed, __version__)):
+                # The same or a newer version is already installed: open its Settings
+                # window instead of replacing (and possibly downgrading) it.
+                if installed and installed != __version__:
+                    log.info("Not replacing installed version %s with older %s; opening it",
+                             installed, __version__)
                 if not send_command("show"):
                     _spawn_detached([str(paths.exe)],
                                     creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
