@@ -33,7 +33,7 @@ from PIL import Image, ImageDraw
 
 import clip_watcher
 
-__version__ = "1.2.1"
+__version__ = "1.3.0"
 APP_NAME = "Clip to Discord"
 REPO = "odehamer/clip-to-discord"
 
@@ -153,7 +153,8 @@ def merge_config(existing: dict, destinations, delete_original: bool,
                  nvidia_enabled: bool = True, medal_enabled: bool = False,
                  medal_dir: str = "", player_name: str = "",
                  clip_seconds: float | None = None, max_upload_mb: float | None = None,
-                 height: int | None = None, fps: int | None = None) -> dict:
+                 height: int | None = None, fps: int | None = None,
+                 amd_enabled: bool = False, amd_dir: str = "") -> dict:
     """Return existing config with the app-controlled keys set; other keys are kept.
 
     `destinations` (Destination objects) replaces the old `webhook_url` key, which is removed.
@@ -167,6 +168,8 @@ def merge_config(existing: dict, destinations, delete_original: bool,
     merged["nvidia_enabled"] = bool(nvidia_enabled)
     merged["medal_enabled"] = bool(medal_enabled)
     merged["medal_dir"] = str(medal_dir)
+    merged["amd_enabled"] = bool(amd_enabled)
+    merged["amd_dir"] = str(amd_dir)
     for key, value in (("clip_seconds", clip_seconds), ("max_upload_mb", max_upload_mb),
                        ("height", height), ("fps", fps)):
         if value is not None:
@@ -237,13 +240,20 @@ def normalize_medal_dir(folder: str) -> str:
     return folder
 
 
-def initial_sources(raw: dict, valid: bool, nvidia_found: bool, medal_found: bool) -> tuple[bool, bool]:
-    """Which source boxes start ticked: detection on first run, saved values afterwards."""
+def normalize_amd_dir(folder: str) -> str:
+    return folder.strip()
+
+
+def initial_sources(raw: dict, valid: bool, nvidia_found: bool, medal_found: bool,
+                    amd_found: bool = False) -> tuple[bool, bool, bool]:
+    """Which source boxes start ticked (NVIDIA, Medal, AMD): detection on first run,
+    saved values afterwards."""
     if valid:
-        return bool(raw.get("nvidia_enabled", True)), bool(raw.get("medal_enabled", False))
-    if not nvidia_found and not medal_found:
-        return True, False
-    return nvidia_found, medal_found
+        return (bool(raw.get("nvidia_enabled", True)), bool(raw.get("medal_enabled", False)),
+                bool(raw.get("amd_enabled", False)))
+    if not nvidia_found and not medal_found and not amd_found:
+        return True, False, False
+    return nvidia_found, medal_found, amd_found
 
 
 def parse_sha256(text: str) -> str:
@@ -292,10 +302,11 @@ def save_config(path: Path, destinations, delete_original: bool,
                 nvidia_enabled: bool = True, medal_enabled: bool = False,
                 medal_dir: str = "", player_name: str = "",
                 clip_seconds: float | None = None, max_upload_mb: float | None = None,
-                height: int | None = None, fps: int | None = None) -> dict:
+                height: int | None = None, fps: int | None = None,
+                amd_enabled: bool = False, amd_dir: str = "") -> dict:
     merged = merge_config(load_raw_config(path), destinations, delete_original,
                           nvidia_enabled, medal_enabled, medal_dir, player_name,
-                          clip_seconds, max_upload_mb, height, fps)
+                          clip_seconds, max_upload_mb, height, fps, amd_enabled, amd_dir)
     _write_config(path, merged)
     return merged
 
@@ -500,6 +511,18 @@ def medal_detected() -> bool:
     return clip_watcher.detect_medal_dir() is not None
 
 
+AMD_SOFTWARE_EXE = Path(r"C:\Program Files\AMD\CNext\CNext\RadeonSoftware.exe")
+
+
+def amd_detected() -> bool:
+    try:
+        if AMD_SOFTWARE_EXE.exists():
+            return True
+    except OSError:
+        pass
+    return clip_watcher.detect_amd_dir() is not None
+
+
 # --------------------------------------------------------------------------
 # Update check
 # --------------------------------------------------------------------------
@@ -702,15 +725,18 @@ def schedule_dir_removal(app_dir: Path) -> None:
 # --------------------------------------------------------------------------
 
 DELETE_LABEL = "Delete the original clip after it's posted. The Discord copy will be the only copy."
-NO_SOURCE_WARNING = ("Neither NVIDIA software nor Medal was found on this PC. "
+NO_SOURCE_WARNING = ("No NVIDIA software, AMD software or Medal was found on this PC. "
                      "Install one of them to record clips.")
-INTRO = ("Save a clip in a game with NVIDIA Instant Replay or Medal, and it is posted to the "
-         "Discord channels you choose below.")
+INTRO = ("Save a clip in a game with NVIDIA Instant Replay, AMD Instant Replay or Medal, and it "
+         "is posted to the Discord channels you choose below.")
 NVIDIA_HELP = ("In a game, press Alt+Z, turn Instant Replay on, then use your save hotkey "
                "(Alt+F10 by default).")
 MEDAL_HELP = "Clips you save with Medal are posted. Medal keeps its own copy."
-DELETE_NOTE = "Applies to NVIDIA clips. Medal clips are always kept."
+AMD_HELP = "Instant Replay saves and recordings are both posted."
+DELETE_NOTE = "Medal clips and AMD videos over 3 minutes are always kept."
 NO_SOURCE_ERROR = "Tick at least one place your clips come from."
+AMD_FOLDER_ERROR = ("Choose your AMD recordings folder. AMD Software's Media Save Location "
+                    "setting shows where it is.")
 MEDAL_FOLDER_ERROR = ("Choose your Medal clips folder. In Medal: Settings → PC Storage shows "
                       "where it is; pick the Clips folder inside it.")
 NAME_HELP = "Shown as the sender of your clips. Leave empty to use the webhook's name."
@@ -836,11 +862,15 @@ class SettingsWindow:
         self.name_error_var = tk.StringVar()
         self.autostart_var = tk.BooleanVar(value=autostart_enabled() if has_config else True)
         self.delete_var = tk.BooleanVar(value=bool(raw.get("delete_original_after_upload", True)))
-        nvidia_found, medal_found = nvidia_detected(), medal_detected()
-        self.sources_found = (nvidia_found, medal_found)
-        nv_on, md_on = initial_sources(raw, has_config, nvidia_found, medal_found)
+        nvidia_found, medal_found, amd_found = nvidia_detected(), medal_detected(), amd_detected()
+        self.sources_found = (nvidia_found, medal_found, amd_found)
+        nv_on, md_on, amd_on = initial_sources(raw, has_config, nvidia_found, medal_found,
+                                               amd_found)
         self.nvidia_var = tk.BooleanVar(value=nv_on)
         self.medal_var = tk.BooleanVar(value=md_on)
+        self.amd_var = tk.BooleanVar(value=amd_on)
+        self.amd_dir_var = tk.StringVar(
+            value=str(raw.get("amd_dir") or "") or clip_watcher.detect_amd_dir() or "")
         self.medal_dir_var = tk.StringVar(
             value=str(raw.get("medal_dir") or "") or clip_watcher.detect_medal_dir() or "")
         self.msg_var = tk.StringVar()
@@ -944,7 +974,21 @@ class SettingsWindow:
         self.medal_browse_btn = ttk.Button(mrow, text="Browse…", command=self.on_browse_medal)
         self.medal_browse_btn.pack(side="left")
         self._update_medal_state()
-        if not (self.sources_found[0] or self.sources_found[1]):
+        self.amd_cb = ttk.Checkbutton(box, text="AMD Instant Replay", variable=self.amd_var,
+                                      command=self._update_amd_state)
+        self.amd_cb.pack(anchor="w", pady=(8, 0))
+        ttk.Label(box, text=AMD_HELP, wraplength=wrap, justify="left",
+                  foreground=GREY).pack(anchor="w", padx=(24, 0), pady=(0, 4))
+        arow = ttk.Frame(box)
+        arow.pack(fill="x", padx=(24, 0))
+        self.amd_label = ttk.Label(arow, text="AMD recordings folder")
+        self.amd_label.pack(side="left")
+        self.amd_entry = ttk.Entry(arow, textvariable=self.amd_dir_var, state="readonly")
+        self.amd_entry.pack(side="left", fill="x", expand=True, padx=(8, 8))
+        self.amd_browse_btn = ttk.Button(arow, text="Browse…", command=self.on_browse_amd)
+        self.amd_browse_btn.pack(side="left")
+        self._update_amd_state()
+        if not any(self.sources_found):
             self.warning = ttk.Label(box, text=NO_SOURCE_WARNING, wraplength=WIDTH - 120,
                                      foreground=AMBER, justify="left")
             self.warning.pack(anchor="w", pady=(8, 0))
@@ -1039,6 +1083,21 @@ class SettingsWindow:
                                          initialdir=start, mustexist=True)
         if chosen:
             self.medal_dir_var.set(normalize_medal_dir(str(Path(chosen))))
+
+    def _update_amd_state(self) -> None:
+        on = self.amd_var.get()
+        self.amd_entry.configure(state="readonly" if on else "disabled")
+        self.amd_browse_btn.configure(state="normal" if on else "disabled")
+        self.amd_label.configure(state="normal" if on else "disabled")
+
+    def on_browse_amd(self) -> None:
+        from tkinter import filedialog
+        current = self.amd_dir_var.get()
+        start = current if current and Path(current).is_dir() else None
+        chosen = filedialog.askdirectory(parent=self.top, title="Choose your AMD recordings folder",
+                                         initialdir=start, mustexist=True)
+        if chosen:
+            self.amd_dir_var.set(normalize_amd_dir(str(Path(chosen))))
 
     # -- player name -----------------------------------------------------------
     def _on_name_changed(self, fit: bool = True) -> None:
@@ -1209,19 +1268,27 @@ class SettingsWindow:
         self.fit()
 
     # -- actions -------------------------------------------------------------
-    def _valid_sources(self) -> str | None:
-        """Returns the Medal folder to save ('' when Medal is off), or None after showing an error."""
-        if not self.nvidia_var.get() and not self.medal_var.get():
+    def _valid_sources(self) -> tuple[str, str] | None:
+        """Returns (Medal folder, AMD folder) to save (the current text when that source is
+        off), or None after showing an error."""
+        if not (self.nvidia_var.get() or self.medal_var.get() or self.amd_var.get()):
             self.set_message(NO_SOURCE_ERROR, "error")
             return None
-        if not self.medal_var.get():
-            return self.medal_dir_var.get().strip()
-        folder = normalize_medal_dir(self.medal_dir_var.get())
-        if not folder or not Path(folder).is_dir():
-            self.set_message(MEDAL_FOLDER_ERROR, "error")
-            return None
-        self.medal_dir_var.set(folder)
-        return folder
+        medal_dir = self.medal_dir_var.get().strip()
+        if self.medal_var.get():
+            medal_dir = normalize_medal_dir(self.medal_dir_var.get())
+            if not medal_dir or not Path(medal_dir).is_dir():
+                self.set_message(MEDAL_FOLDER_ERROR, "error")
+                return None
+            self.medal_dir_var.set(medal_dir)
+        amd_dir = self.amd_dir_var.get().strip()
+        if self.amd_var.get():
+            amd_dir = normalize_amd_dir(self.amd_dir_var.get())
+            if not amd_dir or not Path(amd_dir).is_dir():
+                self.set_message(AMD_FOLDER_ERROR, "error")
+                return None
+            self.amd_dir_var.set(amd_dir)
+        return medal_dir, amd_dir
 
     def on_save(self) -> None:
         name_error = clip_watcher.validate_player_name(self.name_var.get())
@@ -1233,16 +1300,18 @@ class SettingsWindow:
             self.nb.select(self.setup_tab)
             self.set_message(NO_DESTINATIONS_ERROR, "error")
             return
-        medal_dir = self._valid_sources()
-        if medal_dir is None:
+        folders = self._valid_sources()
+        if folders is None:
             self.nb.select(self.setup_tab)
             return
+        medal_dir, amd_dir = folders
         clips = self.clip_values()
         try:
             save_config(self.app.paths.config, self.destinations, self.delete_var.get(),
                         self.nvidia_var.get(), self.medal_var.get(), medal_dir,
                         self.name_var.get().strip(), clips["clip_seconds"],
-                        clips["max_upload_mb"], clips["height"], clips["fps"])
+                        clips["max_upload_mb"], clips["height"], clips["fps"],
+                        self.amd_var.get(), amd_dir)
         except OSError as e:
             self.set_message(f"Could not save your settings ({e.strerror or e}).", "error")
             return

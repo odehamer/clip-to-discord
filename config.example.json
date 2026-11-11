@@ -13,5 +13,7 @@
   "nvidia_enabled": true,
   "medal_enabled": false,
   "medal_dir": "",
-  "medal_delete_original": false
+  "medal_delete_original": false,
+  "amd_enabled": false,
+  "amd_dir": ""
 }

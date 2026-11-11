@@ -1,4 +1,4 @@
-"""Watch NVIDIA Instant Replay and Medal saves, trim, re-encode and post them to a Discord webhook.
+"""Watch NVIDIA Instant Replay, Medal and AMD Instant Replay saves, trim, re-encode and post them to a Discord webhook.
 
 Standard library only. Run with pythonw.exe for a background (no console) watcher.
 
@@ -84,6 +84,8 @@ class Config:
     medal_enabled: bool = False
     medal_dir: str = ""
     medal_delete_original: bool = False
+    amd_enabled: bool = False
+    amd_dir: str = ""
 
 
 @dataclass(frozen=True)
@@ -91,8 +93,10 @@ class Source:
     """One place clips are saved to: a folder, the file suffix to look for, a deletion rule."""
     name: str
     dir: Path
-    suffix: str
+    suffix: "str | tuple[str, ...]"
     delete_original: bool
+    delete_max_seconds: float | None = None   # only delete originals up to this length (None = any)
+    retry_unstable: bool = False              # keep retrying a file that is still growing
 
 
 @dataclass(frozen=True)
@@ -237,12 +241,21 @@ def game_from_medal_name(stem: str) -> str | None:
     return None
 
 
-def derive_game_name(path: Path, base_dir: Path) -> str:
+AMD_SOURCE_NAME = "AMD"
+AMD_DELETE_MAX_SECONDS = 180.0
+
+
+def derive_game_name(path: Path, base_dir: Path, source_name: str | None = None) -> str:
     parent = path.parent
     try:
         same = parent.resolve() == base_dir.resolve()
     except OSError:
         same = parent == base_dir
+    if source_name == AMD_SOURCE_NAME:
+        # AMD names its files by date only: the game is the subfolder, if there is a real one
+        if not same and parent.name and parent.name.lower() != "unknown":
+            return parent.name
+        return "Clip"
     if not same and parent.name:
         return parent.name
     m = DATE_RE.search(path.name)
@@ -284,6 +297,19 @@ def detect_medal_dir(candidates: list[Path] | tuple[Path, ...] | None = None) ->
     return None
 
 
+def detect_amd_dir(candidates: list[Path] | tuple[Path, ...] | None = None) -> str | None:
+    """The AMD Radeon ReLive recordings folder if it exists, else None."""
+    if candidates is None:
+        candidates = [Path.home() / "Videos" / "Radeon ReLive"]
+    for c in candidates:
+        try:
+            if Path(c).is_dir():
+                return str(c)
+        except OSError:
+            continue
+    return None
+
+
 def get_sources(cfg: Config) -> list[Source]:
     sources: list[Source] = []
     if cfg.nvidia_enabled:
@@ -296,11 +322,29 @@ def get_sources(cfg: Config) -> list[Source]:
         else:
             log.warning("Medal is enabled but its clips folder could not be found; "
                         "set medal_dir to use it")
+    if cfg.amd_enabled:
+        amd = cfg.amd_dir or detect_amd_dir()
+        if amd:
+            sources.append(Source(AMD_SOURCE_NAME, Path(amd), (".mp4", ".mkv"),
+                                  cfg.delete_original_after_upload,
+                                  delete_max_seconds=AMD_DELETE_MAX_SECONDS,
+                                  retry_unstable=True))
+        else:
+            log.warning("AMD is enabled but its recordings folder could not be found; "
+                        "set amd_dir to use it")
     return sources
 
 
-def should_delete_original(cfg: Config, source: Source | None) -> bool:
-    return cfg.delete_original_after_upload if source is None else source.delete_original
+def should_delete_original(cfg: Config, source: Source | None,
+                           duration: float | None = None) -> bool:
+    if source is None:
+        return cfg.delete_original_after_upload
+    if not source.delete_original:
+        return False
+    if source.delete_max_seconds is not None and (
+            duration is None or duration > source.delete_max_seconds):
+        return False
+    return True
 
 
 def build_multipart(payload_json: str, filename: str, file_bytes: bytes,
@@ -588,7 +632,7 @@ def process_clip(cfg: Config, tools: tuple[Path, Path], src: Path, dry_run: bool
     t0 = time.time()
     base_dir = Path(cfg.watch_dir) if source is None else source.dir
     source_name = "NVIDIA" if source is None else source.name
-    game = derive_game_name(src, base_dir)
+    game = derive_game_name(src, base_dir, source_name)
     out = TMP_DIR / (src.stem + ".mp4")
     keep_out = dry_run
     try:
@@ -658,8 +702,12 @@ def process_clip(cfg: Config, tools: tuple[Path, Path], src: Path, dry_run: bool
             log.error("Clip %s was not posted everywhere; the original is kept", src.name)
             notify(*failure_notice(results))
             return False
-        if should_delete_original(cfg, source):
+        if should_delete_original(cfg, source, duration):
             os.remove(src)
+        elif (source is not None and source.delete_original
+              and source.delete_max_seconds is not None):
+            log.info("Keeping %s: it is %.0fs long (originals over %.0fs are never deleted)",
+                     src.name, duration, source.delete_max_seconds)
         log.info("Uploaded %s game=%s source=%.1fMB upload=%.1fMB destinations=%d took=%.0fs",
                  source_name, game, src_size / 1048576, up_size / 1048576, len(results),
                  time.time() - t0)
@@ -677,8 +725,8 @@ def process_clip(cfg: Config, tools: tuple[Path, Path], src: Path, dry_run: bool
 # Watching
 # --------------------------------------------------------------------------
 
-def scan(watch_dir: str, suffix: str) -> set[str]:
-    suffix = suffix.lower()
+def scan(watch_dir: str, suffix: "str | tuple[str, ...]") -> set[str]:
+    suffix = suffix.lower() if isinstance(suffix, str) else tuple(x.lower() for x in suffix)
     found: set[str] = set()
 
     def walk(d: str) -> None:
@@ -774,6 +822,10 @@ def watch(cfg: Config, tools: tuple[Path, Path],
                 if paused is not None and paused.is_set():
                     continue
                 if not wait_until_stable(path):
+                    if src.retry_unstable:
+                        log.info("%s is still being written; will try again", path)
+                        seen.discard(path)
+                        continue
                     log.error("Timed out waiting for %s to finish writing", path)
                     notify("Clip not processed", f"Timed out waiting for {Path(path).name}")
                     continue
@@ -825,7 +877,7 @@ def main() -> int:
         return 0
     sources = get_sources(cfg)
     if not sources:
-        return fail("no clip source is enabled (check nvidia_enabled, medal_enabled and medal_dir)")
+        return fail("no clip source is enabled (check nvidia_enabled, medal_enabled and amd_enabled and their folders)")
     if not any(s.dir.is_dir() for s in sources):
         return fail("no clips folder exists: " + ", ".join(f"{s.name}: {s.dir}" for s in sources))
     watch(cfg, tools)

@@ -7,8 +7,12 @@ A Windows tray app that takes game clips saved by a capture app and posts them t
 ### Clips
 
 **Capture app**:
-The program that records gameplay and saves clips to disk: NVIDIA Instant Replay or Medal.
-_Avoid_: Source, recorder
+The program that records gameplay and saves clips to disk: NVIDIA Instant Replay, AMD Instant Replay (part of AMD Software: Adrenalin Edition) or Medal.
+_Avoid_: Source, recorder, ReLive (for AMD)
+
+**Manual recording**:
+A recording the player started and stopped by hand, rather than a replay save. AMD saves these in the same folder as replays, so they are posted too, but their originals are never deleted when longer than three minutes.
+_Avoid_: Recording (alone)
 
 **Original**:
 The clip file exactly as the capture app saved it, before trimming or shrinking.

@@ -1,21 +1,22 @@
 # Clip to Discord
 
-Save a clip in any game with NVIDIA Instant Replay or Medal, and it lands in your Discord channels a few seconds later.
+Save a clip in any game with NVIDIA Instant Replay, AMD Instant Replay or Medal, and it lands in your Discord channels a few seconds later.
 
-A small app sits near the clock and watches the folders where NVIDIA Instant Replay and Medal save clips. For each new clip it:
+A small app sits near the clock and watches the folders where NVIDIA, AMD and Medal save clips. For each new clip it:
 
 1. trims it to the last 30 seconds (you can choose 15 to 90),
 2. shrinks it to fit Discord's upload limit for your server,
 3. posts it to every channel you've switched on, with the game name as the message and your name as the sender,
-4. for NVIDIA clips, deletes the original once every channel has it (you can turn this off). Medal clips are always kept.
+4. for NVIDIA and AMD clips, deletes the original once every channel has it (you can turn this off). Medal clips are always kept.
 
-NVIDIA manual recordings and screenshots are never posted, only Instant Replay saves.
+NVIDIA manual recordings and screenshots are never posted, only Instant Replay saves. AMD keeps replays and manual recordings in the same folder, so every new AMD video is posted (see [Good to know](#good-to-know)).
 
 ## Install
 
 You need Windows 10 or 11 and at least one of these to record clips:
 
-- an NVIDIA graphics card with the NVIDIA app or GeForce Experience (for Instant Replay), or
+- an NVIDIA graphics card with the NVIDIA app or GeForce Experience (for Instant Replay),
+- an AMD Radeon graphics card with AMD Software: Adrenalin Edition (for Instant Replay), or
 - [Medal](https://medal.tv/).
 
 1. **Download** `ClipToDiscord.exe` from the [latest release](https://github.com/odehamer/clip-to-discord/releases/latest).
@@ -23,12 +24,13 @@ You need Windows 10 or 11 and at least one of these to record clips:
 3. **Make a webhook in Discord.** Open your channel's settings, then **Integrations → Webhooks → New Webhook → Copy Webhook URL**.
 4. **Add it in the app.** Click **Add destination…**, give it a name you'll recognise (like "Friends #clips"), paste the URL, and click **Test** to check it.
 5. **Type your name** if you want your clips to show it as the sender.
-6. **Tick where your clips come from:** NVIDIA Instant Replay, Medal, or both. The app pre-ticks whichever it finds on your PC.
+6. **Tick where your clips come from:** NVIDIA Instant Replay, AMD Instant Replay, Medal, or several. The app pre-ticks whichever it finds on your PC.
 7. Click **Save**. The first time, the app downloads the video tools it needs (about 110 MB).
 
 Then save a clip in a game and check your channel:
 
 - **NVIDIA:** press **Alt+Z** in a game, switch Instant Replay on, then use your save hotkey (**Alt+F10** by default).
+- **AMD:** press **Alt+R** to open AMD Software, go to **Record & Stream**, switch **Instant Replay** on, then use your Save Instant Replay hotkey (shown on that page).
 - **Medal:** use your Medal clip hotkey as usual.
 
 After the first run you can delete the downloaded file. The app keeps its own copy and starts with Windows.
@@ -41,8 +43,8 @@ Open it from the tray icon (**Settings…**). Changes apply as soon as you click
 
 - **Your name.** Shown as the sender of your clips, up to 32 characters. Leave it empty to use the webhook's own name. Discord doesn't allow names containing "discord" or "clyde".
 - **Where clips are posted.** Each destination is one Discord channel. Add as many as you like, switch each on or off, and use **Test** to send a test message. Every clip goes to every destination that's switched on.
-- **Where your clips come from.** NVIDIA Instant Replay, Medal, or both, plus Medal's clips folder.
-- **Start with Windows** and **Delete the original clip after it's posted**.
+- **Where your clips come from.** NVIDIA Instant Replay, AMD Instant Replay and Medal, plus the AMD and Medal folders.
+- **Start with Windows** and **Delete the original clip after it's posted** (NVIDIA and AMD only).
 
 ### Clips tab
 
@@ -58,12 +60,14 @@ The tab warns you when a combination will look blocky, such as 90 seconds or 108
 ## Good to know
 
 - **Treat webhook URLs like passwords.** Anyone who has one can post to that channel.
-- **NVIDIA originals are deleted by default.** With that box ticked, the Discord copy becomes the only copy of each NVIDIA clip. A clip that didn't reach every destination is always kept, and Medal clips are never deleted.
-- **Every new clip is posted.** That means every Instant Replay save and every new video in Medal's `Clips` folder, including Medal's automatic clips. Use **Pause posting** in the tray menu when you want to save a clip privately.
+- **NVIDIA and AMD originals are deleted by default.** With that box ticked, the Discord copy becomes the only copy of each clip. A clip that didn't reach every destination is always kept, AMD videos longer than 3 minutes are always kept, and Medal clips are never deleted.
+- **Every new clip is posted.** That means every Instant Replay save, every new video in AMD's `Radeon ReLive` folder (including manual recordings, trimmed to your clip length), and every new video in Medal's `Clips` folder (including Medal's automatic clips). Use **Pause posting** in the tray menu when you want to save or record privately.
+- **AMD support is new.** It was built from AMD's documentation and hasn't been tried on a real AMD card yet. If AMD clips aren't posted, or get the wrong game name, please [open an issue](https://github.com/odehamer/clip-to-discord/issues) with the clip's file name and folder.
+- **AMD's folder.** The app watches `Videos\Radeon ReLive` and the folders inside it. If you changed AMD's **Media Save Location**, use **Browse…** in the Settings window to pick that folder. The game name comes from the folder AMD saved the clip in.
 - **Clip length and Instant Replay.** An NVIDIA clip can't be longer than the Instant Replay length set in the NVIDIA overlay.
 - **Medal's folder.** The app looks for `C:\Medal\Clips`. If you moved Medal's capture folder (Medal: Settings → PC Storage), use **Browse…** in the Settings window to pick the `Clips` folder inside it.
 - **Want the Medal link instead of the video?** Clip to Discord always posts the video file, because Medal offers no way for other apps to look up a clip's link. Medal's own Discord bot, MedalBot, posts Medal links: in Medal, go to **Settings → Connected Accounts → Medal Discord Bot** ([Medal's guide](https://support.medal.tv/support/solutions/articles/48001147847-how-to-setup-medalbot-for-discord-clip-sharing)). Its automatic sharing only covers the server owner's clips; anyone else shares from Medal with **Share → Send to Discord**. If you use MedalBot, untick Medal in Clip to Discord so clips aren't posted twice.
-- **Microphone.** Only the first audio track is posted. If NVIDIA is set to mix your mic into the same track as the game, your voice is in the clip. Choose separate tracks, or turn the mic off, in the overlay's audio settings.
+- **Microphone.** Only the first audio track is posted. If NVIDIA or AMD is set to mix your mic into the same track as the game, your voice is in the clip. Choose separate tracks, or turn the mic off, in its audio settings.
 
 ## The tray icon
 
@@ -87,7 +91,7 @@ Download the new `ClipToDiscord.exe` and run it. It replaces the installed copy 
 
 | Problem | What to check |
 |---|---|
-| Nothing is posted | Is the icon near the clock, and not paused? Is at least one destination switched on under **Post to**? Is the right capture app ticked in Settings? For NVIDIA, is Instant Replay on in the overlay? Open the log from the tray menu. |
+| Nothing is posted | Is the icon near the clock, and not paused? Is at least one destination switched on under **Post to**? Is the right capture app ticked in Settings? For NVIDIA or AMD, is Instant Replay switched on? Open the log from the tray menu. |
 | "Clip not posted everywhere" | One destination refused the clip; the notification names it. HTTP 401 or 404 means its webhook was deleted or the URL is wrong: edit the destination and paste a new one. "Too large" means that server has a lower boost level than the Clips tab says. |
 | The video tools download fails | Check your internet connection and click Retry. |
 | The game stutters after a clip | The graphics-card encoder wasn't available and the slower fallback was used; the log says so. Update your NVIDIA driver. |
@@ -105,7 +109,7 @@ The Settings window covers the usual options. A few more live in `%LOCALAPPDATA%
 | `ffmpeg_path` | `null` | Use your own ffmpeg instead of the downloaded one. |
 | `medal_delete_original` | `false` | Delete Medal's original after a confirmed upload. This leaves a missing clip inside Medal's library. |
 
-The file also holds everything the Settings window sets: `player_name`, `destinations` (a list of `name`, `url` and `enabled`), `clip_seconds`, `max_upload_mb`, `height`, `fps`, `nvidia_enabled`, `medal_enabled`, `medal_dir` and `delete_original_after_upload`.
+The file also holds everything the Settings window sets: `player_name`, `destinations` (a list of `name`, `url` and `enabled`), `clip_seconds`, `max_upload_mb`, `height`, `fps`, `nvidia_enabled`, `amd_enabled`, `amd_dir`, `medal_enabled`, `medal_dir` and `delete_original_after_upload`.
 
 ## Running from source
 
@@ -130,4 +134,4 @@ build.bat
 
 Tests: `python -m unittest discover -s tests`.
 
-Releases are built by GitHub Actions: pushing a tag such as `v1.2.1` (matching `__version__` in `app.py`) builds `ClipToDiscord.exe` and attaches it to a release.
+Releases are built by GitHub Actions: pushing a tag such as `v1.3.0` (matching `__version__` in `app.py`) builds `ClipToDiscord.exe` and attaches it to a release.

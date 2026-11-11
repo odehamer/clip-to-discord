@@ -597,16 +597,228 @@ class MedalConfigTests(unittest.TestCase):
 
     def test_initial_sources(self):
         f = app.initial_sources
-        self.assertEqual(f({}, False, True, False), (True, False))
-        self.assertEqual(f({}, False, False, True), (False, True))
-        self.assertEqual(f({}, False, True, True), (True, True))
-        self.assertEqual(f({}, False, False, False), (True, False))
-        self.assertEqual(f({"webhook_url": "x"}, True, False, True), (True, False))
+        self.assertEqual(f({}, False, True, False), (True, False, False))
+        self.assertEqual(f({}, False, False, True), (False, True, False))
+        self.assertEqual(f({}, False, True, True), (True, True, False))
+        self.assertEqual(f({}, False, False, False), (True, False, False))
+        self.assertEqual(f({"webhook_url": "x"}, True, False, True), (True, False, False))
         self.assertEqual(f({"nvidia_enabled": False, "medal_enabled": True}, True, True, False),
-                         (False, True))
+                         (False, True, False))
+        # AMD
+        self.assertEqual(f({}, False, False, False, True), (False, False, True))
+        self.assertEqual(f({}, False, True, False, True), (True, False, True))
+        self.assertEqual(f({}, False, True, True, True), (True, True, True))
+        self.assertEqual(f({"nvidia_enabled": False, "amd_enabled": True}, True, True, True, False),
+                         (False, False, True))
+        self.assertEqual(f({"webhook_url": "x"}, True, False, False, True), (True, False, False))
 
     def test_version(self):
-        self.assertEqual(app.__version__, "1.2.1")
+        self.assertEqual(app.__version__, "1.3.0")
+
+
+class AmdSourceTests(unittest.TestCase):
+    def test_scan_matches_mp4_and_mkv_only(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            (d / "Game").mkdir()
+            for name in ("a.mp4", "b.MKV", "Game/c.Mp4", "Game/d.mkv", "mic.m4a", "s.png",
+                         "s.jpg", "g.gif", "x.mp4.tmp"):
+                (d / name).write_bytes(b"1")
+            found = clip_watcher.scan(str(d), (".mp4", ".mkv"))
+            self.assertEqual({Path(f).name for f in found}, {"a.mp4", "b.MKV", "c.Mp4", "d.mkv"})
+            # single-string suffixes still work
+            self.assertEqual({Path(f).name for f in clip_watcher.scan(str(d), ".MKV")},
+                             {"b.MKV", "d.mkv"})
+
+    def test_get_sources_explicit_dir(self):
+        cfg = clip_watcher.Config(watch_dir=r"C:\V", nvidia_enabled=False, amd_enabled=True,
+                                  amd_dir=r"D:\AMD", delete_original_after_upload=True)
+        srcs = clip_watcher.get_sources(cfg)
+        self.assertEqual([s.name for s in srcs], ["AMD"])
+        self.assertEqual(srcs[0].dir, Path(r"D:\AMD"))
+        self.assertEqual(tuple(srcs[0].suffix), (".mp4", ".mkv"))
+        self.assertTrue(srcs[0].delete_original)
+        self.assertEqual(srcs[0].delete_max_seconds, 180)
+        self.assertTrue(srcs[0].retry_unstable)
+        cfg2 = clip_watcher.Config(watch_dir=r"C:\V", amd_enabled=True, amd_dir=r"D:\AMD",
+                                   delete_original_after_upload=False)
+        self.assertEqual([s.name for s in clip_watcher.get_sources(cfg2)], ["NVIDIA", "AMD"])
+        self.assertFalse(clip_watcher.get_sources(cfg2)[1].delete_original)
+
+    def test_get_sources_detected_dir_and_missing(self):
+        cfg = clip_watcher.Config(watch_dir=r"C:\V", nvidia_enabled=False, amd_enabled=True)
+        with mock.patch.object(clip_watcher, "detect_amd_dir", return_value=r"E:\Radeon ReLive"):
+            srcs = clip_watcher.get_sources(cfg)
+            self.assertEqual(srcs[0].dir, Path(r"E:\Radeon ReLive"))
+        with mock.patch.object(clip_watcher, "detect_amd_dir", return_value=None):
+            self.assertEqual(clip_watcher.get_sources(cfg), [])
+
+    def test_other_sources_have_no_limits(self):
+        cfg = clip_watcher.Config(watch_dir=r"C:\V", medal_enabled=True, medal_dir=r"D:\M")
+        for s in clip_watcher.get_sources(cfg):
+            self.assertIsNone(s.delete_max_seconds)
+            self.assertFalse(s.retry_unstable)
+
+    def test_detect_amd_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            (d / "b").mkdir()
+            (d / "c").mkdir()
+            self.assertEqual(clip_watcher.detect_amd_dir([d / "a", d / "b", d / "c"]), str(d / "b"))
+            self.assertIsNone(clip_watcher.detect_amd_dir([d / "a"]))
+        with mock.patch.object(Path, "home", return_value=Path(r"Z:\nobody")):
+            self.assertIsNone(clip_watcher.detect_amd_dir())
+
+    def test_should_delete_original_limit(self):
+        cfg = clip_watcher.Config(delete_original_after_upload=True)
+        amd = clip_watcher.get_sources(clip_watcher.Config(
+            nvidia_enabled=False, amd_enabled=True, amd_dir="X",
+            delete_original_after_upload=True))[0]
+        f = clip_watcher.should_delete_original
+        self.assertTrue(f(cfg, amd, 30))
+        self.assertTrue(f(cfg, amd, 180))
+        self.assertFalse(f(cfg, amd, 180.5))
+        self.assertFalse(f(cfg, amd, 3600))
+        off = clip_watcher.get_sources(clip_watcher.Config(
+            nvidia_enabled=False, amd_enabled=True, amd_dir="X",
+            delete_original_after_upload=False))[0]
+        self.assertFalse(f(cfg, off, 30))
+        # no limit on other sources
+        nv = clip_watcher.Source("NVIDIA", Path("a"), ".DVR.mp4", True)
+        self.assertTrue(f(cfg, nv, 99999))
+        self.assertTrue(f(cfg, nv))
+
+    def test_game_names(self):
+        base = Path(r"C:\Videos\Radeon ReLive")
+        d = lambda p: clip_watcher.derive_game_name(p, base, "AMD")  # noqa: E731
+        self.assertEqual(d(base / "Cyberpunk 2077" / "Replay_2024.05.01-20.31.mp4"), "Cyberpunk 2077")
+        self.assertEqual(d(base / "Unknown" / "x.mp4"), "Clip")
+        self.assertEqual(d(base / "unknown" / "x.mkv"), "Clip")
+        self.assertEqual(d(base / "x.mp4"), "Clip")
+        self.assertEqual(d(base / "Replay_2024.05.01-20.31.mp4"), "Clip")
+        self.assertEqual(d(base / "MedalTVValorant1.mp4"), "Clip")
+        self.assertEqual(d(base / "Desktop 2026.11.10 - 12.00.00.01.DVR.mp4"), "Clip")
+
+    def test_other_sources_game_names_unchanged(self):
+        base = Path(r"C:\Videos")
+        d = clip_watcher.derive_game_name
+        for name in (None, "NVIDIA", "Medal"):
+            self.assertEqual(d(base / "Unknown" / "x.mp4", base, name), "Unknown")
+            self.assertEqual(d(base / "Test Game" / "x.mp4", base, name), "Test Game")
+        self.assertEqual(d(base / "MedalTVValorant20240115123456.mp4", base, "Medal"), "Valorant")
+        self.assertEqual(d(base / "Replay_2024.05.01-20.31.mp4", base, "Medal"), "Replay")
+
+    def test_config_keys(self):
+        merged = app.merge_config({"custom": 1}, [DEST_A], True, amd_enabled=True,
+                                  amd_dir=r"D:\AMD")
+        self.assertIs(merged["amd_enabled"], True)
+        self.assertEqual(merged["amd_dir"], r"D:\AMD")
+        self.assertEqual(merged["custom"], 1)
+        merged = app.merge_config({"amd_enabled": True, "amd_dir": "X"}, [DEST_A], True)
+        self.assertIs(merged["amd_enabled"], False)
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "config.json"
+            app.save_config(p, [DEST_A], True, True, False, "", amd_enabled=True, amd_dir="A")
+            cfg = clip_watcher.load_config(p, False)
+            self.assertTrue(cfg.amd_enabled)
+            self.assertEqual(cfg.amd_dir, "A")
+        self.assertFalse(clip_watcher.Config().amd_enabled)
+        self.assertEqual(clip_watcher.Config().amd_dir, "")
+
+    def test_amd_detected(self):
+        with mock.patch.object(clip_watcher, "detect_amd_dir", return_value=None), \
+                mock.patch.object(app, "AMD_SOFTWARE_EXE", Path(r"Z:\nope\x.exe")):
+            self.assertFalse(app.amd_detected())
+        with mock.patch.object(clip_watcher, "detect_amd_dir", return_value=r"C:\R"):
+            self.assertTrue(app.amd_detected())
+        with tempfile.TemporaryDirectory() as d:
+            exe = Path(d) / "RadeonSoftware.exe"
+            exe.write_bytes(b"x")
+            with mock.patch.object(clip_watcher, "detect_amd_dir", return_value=None), \
+                    mock.patch.object(app, "AMD_SOFTWARE_EXE", exe):
+                self.assertTrue(app.amd_detected())
+
+
+class AmdWatchTests(unittest.TestCase):
+    @staticmethod
+    def _counting_scan():
+        """A scan() stand-in that sets an event after the watcher's first (baseline) scan."""
+        first = threading.Event()
+        real_scan = clip_watcher.scan
+
+        def counting(d, suffix):
+            result = real_scan(d, suffix)
+            first.set()
+            return result
+        return counting, first
+
+    def test_unstable_file_is_retried_without_notice(self):
+        with tempfile.TemporaryDirectory() as d:
+            amd = Path(d) / "amd"
+            amd.mkdir()
+            cfg = clip_watcher.Config(webhook_url="x", nvidia_enabled=False, amd_enabled=True,
+                                      amd_dir=str(amd), poll_seconds=0.02)
+            stop = threading.Event()
+            processed: list[str] = []
+            stable_answers = [False, False, True]
+            stable_calls: list[str] = []
+            done = threading.Event()
+
+            def fake_stable(path, *a, **k):
+                stable_calls.append(path)
+                return stable_answers.pop(0) if stable_answers else True
+
+            def fake_process(cfg, tools, p, dry_run, source=None):
+                processed.append(p.name)
+                done.set()
+                return True
+
+            counting, baseline = self._counting_scan()
+            with mock.patch.object(clip_watcher, "wait_until_stable", side_effect=fake_stable), \
+                    mock.patch.object(clip_watcher, "scan", side_effect=counting), \
+                    mock.patch.object(clip_watcher, "notify") as notify, \
+                    mock.patch.object(clip_watcher, "process_clip", side_effect=fake_process):
+                t = threading.Thread(target=clip_watcher.watch,
+                                     args=(cfg, (Path("a"), Path("b")), stop))
+                t.start()
+                try:
+                    self.assertTrue(baseline.wait(10))  # baseline of the empty folder
+                    (amd / "Game").mkdir()
+                    (amd / "Game" / "rec.mkv").write_bytes(b"1")
+                    self.assertTrue(done.wait(10))
+                finally:
+                    stop.set()
+                    t.join(3)
+            self.assertEqual(processed, ["rec.mkv"])
+            self.assertEqual(len(stable_calls), 3)
+            notify.assert_not_called()
+
+    def test_nvidia_unstable_file_is_still_dropped_with_notice(self):
+        with tempfile.TemporaryDirectory() as d:
+            nv = Path(d) / "nv"
+            nv.mkdir()
+            cfg = clip_watcher.Config(webhook_url="x", watch_dir=str(nv), poll_seconds=0.02)
+            stop = threading.Event()
+            noticed = threading.Event()
+            counting, baseline = self._counting_scan()
+            with mock.patch.object(clip_watcher, "wait_until_stable", return_value=False), \
+                    mock.patch.object(clip_watcher, "scan", side_effect=counting), \
+                    mock.patch.object(clip_watcher, "notify",
+                                      side_effect=lambda *a, **k: noticed.set()) as notify, \
+                    mock.patch.object(clip_watcher, "process_clip") as proc:
+                t = threading.Thread(target=clip_watcher.watch,
+                                     args=(cfg, (Path("a"), Path("b")), stop))
+                t.start()
+                try:
+                    self.assertTrue(baseline.wait(10))
+                    (nv / "G 2026.01.02 - 03.04.05.06.DVR.mp4").write_bytes(b"1")
+                    self.assertTrue(noticed.wait(10))
+                    time.sleep(0.2)  # would be re-detected if it had been forgotten
+                finally:
+                    stop.set()
+                    t.join(3)
+            self.assertEqual(notify.call_count, 1)
+            proc.assert_not_called()
 
 
 class SourceWindowTests(unittest.TestCase):
@@ -631,6 +843,8 @@ class SourceWindowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {app.HOME_ENV: d}), \
                 mock.patch.object(app, "nvidia_detected", return_value=False), \
                 mock.patch.object(app, "medal_detected", return_value=False), \
+                mock.patch.object(app, "amd_detected", return_value=False), \
+                mock.patch.object(clip_watcher, "detect_amd_dir", return_value=None), \
                 mock.patch.object(clip_watcher, "detect_medal_dir", return_value=None):
             a = self._window()
             try:
@@ -668,6 +882,8 @@ class SourceWindowTests(unittest.TestCase):
             (medal / "Clips").mkdir(parents=True)
             with mock.patch.object(app, "nvidia_detected", return_value=False), \
                     mock.patch.object(app, "medal_detected", return_value=True), \
+                    mock.patch.object(app, "amd_detected", return_value=False), \
+                    mock.patch.object(clip_watcher, "detect_amd_dir", return_value=None), \
                     mock.patch.object(clip_watcher, "detect_medal_dir", return_value=None), \
                     mock.patch.object(app.App, "prepare_and_start"), \
                     mock.patch.object(app, "set_autostart"):
