@@ -1,0 +1,48 @@
+name: Release
+
+# Pushing a tag like v1.0.0 builds ClipToDiscord.exe from this source
+# and attaches it to a GitHub Release.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build tools
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+
+      - name: Check the tag matches the app version
+        shell: pwsh
+        run: |
+          $version = python -c "import app; print(app.__version__)"
+          if ("v$version" -ne "${{ github.ref_name }}") {
+            Write-Error "Tag ${{ github.ref_name }} does not match app.__version__ ($version)"
+            exit 1
+          }
+
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Build the exe
+        run: python -m PyInstaller --noconfirm --clean --onefile --windowed --name ClipToDiscord --icon assets\icon.ico app.py
+
+      - name: Publish the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $hash = (Get-FileHash dist\ClipToDiscord.exe -Algorithm SHA256).Hash.ToLower()
+          $notes = "Download **ClipToDiscord.exe** below and run it.`n`nWindows may show a ""Windows protected your PC"" notice because the file is not code-signed: choose **More info**, then **Run anyway**.`n`nSHA-256: ``$hash``"
+          gh release create "${{ github.ref_name }}" dist\ClipToDiscord.exe --title "Clip to Discord ${{ github.ref_name }}" --notes $notes

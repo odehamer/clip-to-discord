@@ -3,3 +3,6 @@ config.json
 state.json
 tmp/
 __pycache__/
+build/
+dist/
+*.spec

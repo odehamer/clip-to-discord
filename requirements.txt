@@ -1,0 +1,4 @@
+pystray==0.19.5
+Pillow==13.0.0
+certifi==2026.10.23
+pyinstaller==6.22.3

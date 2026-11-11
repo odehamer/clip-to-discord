@@ -22,6 +22,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -44,6 +45,15 @@ BELOW_NORMAL_PRIORITY_CLASS = 0x00004000
 RETRY_WAITS = (5, 15, 30)
 
 log = logging.getLogger("clip_watcher")
+_logging_ready = False
+
+
+def set_paths(base_dir: Path) -> None:
+    """Move the tmp folder and log file under base_dir (used by the GUI app)."""
+    global TMP_DIR, LOG_PATH
+    base_dir = Path(base_dir)
+    TMP_DIR = base_dir / "tmp"
+    LOG_PATH = base_dir / "clip_watcher.log"
 
 
 class ClipError(Exception):
@@ -138,6 +148,11 @@ def build_multipart(payload_json: str, filename: str, file_bytes: bytes,
 # --------------------------------------------------------------------------
 
 def setup_logging() -> None:
+    global _logging_ready
+    if _logging_ready:
+        return
+    _logging_ready = True
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     log.setLevel(logging.INFO)
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
     fh = logging.handlers.RotatingFileHandler(
@@ -204,11 +219,14 @@ def _exe_beside(ffmpeg: Path, name: str) -> Path:
     return ffmpeg.with_name(name + ffmpeg.suffix)
 
 
-def find_ffmpeg(configured: str | None) -> tuple[Path, Path] | None:
+def find_ffmpeg(configured: str | None,
+                extra_dirs: list[Path] | tuple[Path, ...] = ()) -> tuple[Path, Path] | None:
     candidates: list[Path] = []
     if configured:
         p = Path(configured)
         candidates.append(p / "ffmpeg.exe" if p.is_dir() else p)
+    for d in extra_dirs:
+        candidates.append(Path(d) / "ffmpeg.exe")
     which = shutil.which("ffmpeg")
     if which:
         candidates.append(Path(which))
@@ -293,12 +311,38 @@ def encode(tools: tuple[Path, Path], src: Path, out: Path, start: float, length:
 # Upload
 # --------------------------------------------------------------------------
 
+def open_url(req: urllib.request.Request, timeout: float):
+    """Open a request. The GUI app replaces this to add a fallback certificate store."""
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def post_text(webhook_url: str, text: str) -> None:
+    """Post a plain text message. Raises ClipError (never containing the URL) on failure."""
+    body = json.dumps({"content": text, "allowed_mentions": {"parse": []}}).encode("utf-8")
+    req = urllib.request.Request(
+        webhook_url + "?wait=true", data=body, method="POST",
+        headers={"Content-Type": "application/json", "User-Agent": "clip-to-discord/1.0"})
+    try:
+        with open_url(req, 20) as resp:
+            resp.read()
+        return
+    except urllib.error.HTTPError as e:
+        try:
+            data = json.loads(e.read().decode("utf-8", "replace"))
+            detail = data.get("message", "") if isinstance(data, dict) else ""
+        except ValueError:
+            detail = ""
+        raise ClipError(f"Discord said no (HTTP {e.code}). {detail}".strip()) from None
+    except (urllib.error.URLError, OSError, TimeoutError) as e:
+        raise ClipError(f"Could not reach Discord ({type(e).__name__}). Check your internet connection.") from None
+
+
 def _post_once(url: str, body: bytes, content_type: str) -> tuple[int, dict, dict]:
     req = urllib.request.Request(
         url + "?wait=true", data=body, method="POST",
         headers={"Content-Type": content_type, "User-Agent": "clip-to-discord/1.0"})
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with open_url(req, 120) as resp:
             status, raw, headers = resp.status, resp.read(), dict(resp.headers)
     except urllib.error.HTTPError as e:
         status, raw, headers = e.code, e.read(), dict(e.headers)
@@ -488,22 +532,35 @@ def acquire_lock() -> socket.socket | None:
     return s
 
 
-def watch(cfg: Config, tools: tuple[Path, Path]) -> None:
+def watch(cfg: Config, tools: tuple[Path, Path],
+          stop: threading.Event | None = None,
+          paused: threading.Event | None = None) -> None:
     seen = scan(cfg.watch_dir, cfg.filename_suffix)
     log.info("Watching %s (%d existing clips ignored)", cfg.watch_dir, len(seen))
-    while True:
+    while not (stop and stop.is_set()):
         try:
-            new = sorted(scan(cfg.watch_dir, cfg.filename_suffix) - seen)
-            for path in new:
-                seen.add(path)
-                if not wait_until_stable(path):
-                    log.error("Timed out waiting for %s to finish writing", path)
-                    notify("Clip not processed", f"Timed out waiting for {Path(path).name}")
-                    continue
-                process_clip(cfg, tools, Path(path), dry_run=False)
+            current = scan(cfg.watch_dir, cfg.filename_suffix)
+            if paused is not None and paused.is_set():
+                seen |= current  # clips saved while paused are skipped for good
+            else:
+                for path in sorted(current - seen):
+                    if stop and stop.is_set():
+                        return
+                    seen.add(path)
+                    if paused is not None and paused.is_set():
+                        continue
+                    if not wait_until_stable(path):
+                        log.error("Timed out waiting for %s to finish writing", path)
+                        notify("Clip not processed", f"Timed out waiting for {Path(path).name}")
+                        continue
+                    process_clip(cfg, tools, Path(path), dry_run=False)
         except Exception:  # noqa: BLE001 - never kill the loop
             log.exception("Error in watch loop")
-        time.sleep(cfg.poll_seconds)
+        if stop is not None:
+            if stop.wait(cfg.poll_seconds):
+                return
+        else:
+            time.sleep(cfg.poll_seconds)
 
 
 def fail(msg: str) -> int:
