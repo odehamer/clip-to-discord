@@ -33,7 +33,7 @@ from PIL import Image, ImageDraw
 
 import clip_watcher
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 APP_NAME = "Clip to Discord"
 REPO = "odehamer/clip-to-discord"
 

@@ -606,7 +606,7 @@ class MedalConfigTests(unittest.TestCase):
                          (False, True))
 
     def test_version(self):
-        self.assertEqual(app.__version__, "1.1.0")
+        self.assertEqual(app.__version__, "1.2.0")
 
 
 class SourceWindowTests(unittest.TestCase):
