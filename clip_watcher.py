@@ -1,4 +1,4 @@
-"""Watch NVIDIA Instant Replay saves, trim, re-encode and post them to a Discord webhook.
+"""Watch NVIDIA Instant Replay and Medal saves, trim, re-encode and post them to a Discord webhook.
 
 Standard library only. Run with pythonw.exe for a background (no console) watcher.
 
@@ -28,6 +28,7 @@ import urllib.error
 import urllib.request
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -77,6 +78,19 @@ class Config:
     poll_seconds: float = 2
     filename_suffix: str = ".DVR.mp4"
     ffmpeg_path: str | None = None
+    nvidia_enabled: bool = True
+    medal_enabled: bool = False
+    medal_dir: str = ""
+    medal_delete_original: bool = False
+
+
+@dataclass(frozen=True)
+class Source:
+    """One place clips are saved to: a folder, the file suffix to look for, a deletion rule."""
+    name: str
+    dir: Path
+    suffix: str
+    delete_original: bool
 
 
 # --------------------------------------------------------------------------
@@ -102,12 +116,28 @@ def sanitize_filename(name: str) -> str:
     return name or "clip"
 
 
-def derive_game_name(path: Path, watch_dir: Path) -> str:
+_MEDAL_PREFIX_RE = re.compile(r"^medaltv", re.IGNORECASE)
+_MEDAL_TRAIL_RE = re.compile(r"[\d\s\-_.]+$")
+_MEDAL_LEAD_RE = re.compile(r"^[\s\-_.]+")
+_DVR_TAIL_RE = re.compile(r"\.dvr$", re.IGNORECASE)
+
+
+def game_from_medal_name(stem: str) -> str | None:
+    """Best-effort game name from a Medal-style file name (without extension), or None."""
+    name = _MEDAL_PREFIX_RE.sub("", stem.strip())
+    name = _MEDAL_LEAD_RE.sub("", name)
+    name = _MEDAL_TRAIL_RE.sub("", name)
+    if sum(ch.isalpha() for ch in name) >= 2:
+        return name
+    return None
+
+
+def derive_game_name(path: Path, base_dir: Path) -> str:
     parent = path.parent
     try:
-        same = parent.resolve() == watch_dir.resolve()
+        same = parent.resolve() == base_dir.resolve()
     except OSError:
-        same = parent == watch_dir
+        same = parent == base_dir
     if not same and parent.name:
         return parent.name
     m = DATE_RE.search(path.name)
@@ -115,13 +145,57 @@ def derive_game_name(path: Path, watch_dir: Path) -> str:
         text = path.name[: m.start()].strip(" -_.")
         if text:
             return text
+    else:
+        guess = game_from_medal_name(_DVR_TAIL_RE.sub("", path.stem))
+        if guess:
+            return guess
     return "Clip"
 
 
 def upload_filename(game: str, path: Path) -> str:
     m = DATE_RE.search(path.name)
-    stamp = f"{m[1]}-{m[2]}-{m[3]} {m[4]}.{m[5]}" if m else ""
+    if m:
+        stamp = f"{m[1]}-{m[2]}-{m[3]} {m[4]}.{m[5]}"
+    else:
+        try:
+            stamp = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H.%M")
+        except (OSError, ValueError, OverflowError):
+            stamp = ""
     return sanitize_filename(f"{game} {stamp}".strip()) + ".mp4"
+
+
+def detect_medal_dir(candidates: list[Path] | tuple[Path, ...] | None = None) -> str | None:
+    """First existing Medal clips folder among the usual places, else None."""
+    if candidates is None:
+        home = Path.home()
+        candidates = [Path(r"C:\Medal\Clips"), home / "Videos" / "Medal" / "Clips",
+                      home / "Medal" / "Clips"]
+    for c in candidates:
+        try:
+            if Path(c).is_dir():
+                return str(c)
+        except OSError:
+            continue
+    return None
+
+
+def get_sources(cfg: Config) -> list[Source]:
+    sources: list[Source] = []
+    if cfg.nvidia_enabled:
+        sources.append(Source("NVIDIA", Path(cfg.watch_dir), cfg.filename_suffix,
+                              cfg.delete_original_after_upload))
+    if cfg.medal_enabled:
+        medal = cfg.medal_dir or detect_medal_dir()
+        if medal:
+            sources.append(Source("Medal", Path(medal), ".mp4", cfg.medal_delete_original))
+        else:
+            log.warning("Medal is enabled but its clips folder could not be found; "
+                        "set medal_dir to use it")
+    return sources
+
+
+def should_delete_original(cfg: Config, source: Source | None) -> bool:
+    return cfg.delete_original_after_upload if source is None else source.delete_original
 
 
 def build_multipart(payload_json: str, filename: str, file_bytes: bytes,
@@ -401,10 +475,12 @@ def remove_quietly(path: Path) -> None:
         log.warning("could not delete %s: %s", path, e)
 
 
-def process_clip(cfg: Config, tools: tuple[Path, Path], src: Path, dry_run: bool) -> bool:
+def process_clip(cfg: Config, tools: tuple[Path, Path], src: Path, dry_run: bool,
+                 source: Source | None = None) -> bool:
     t0 = time.time()
-    watch_dir = Path(cfg.watch_dir)
-    game = derive_game_name(src, watch_dir)
+    base_dir = Path(cfg.watch_dir) if source is None else source.dir
+    source_name = "NVIDIA" if source is None else source.name
+    game = derive_game_name(src, base_dir)
     out = TMP_DIR / (src.stem + ".mp4")
     keep_out = dry_run
     try:
@@ -416,7 +492,7 @@ def process_clip(cfg: Config, tools: tuple[Path, Path], src: Path, dry_run: bool
         height = min(cfg.height, src_h) if src_h else cfg.height
         base_kbps = compute_video_kbps(length, cfg.max_upload_mb, cfg.audio_kbps)
         limit = cfg.max_upload_mb * 1024 * 1024
-        log.info("Processing %s (%.1fs, game=%s)", src.name, duration, game)
+        log.info("Processing %s clip %s (%.1fs, game=%s)", source_name, src.name, duration, game)
 
         encoder = "h264_nvenc"
         kbps = base_kbps
@@ -458,10 +534,10 @@ def process_clip(cfg: Config, tools: tuple[Path, Path], src: Path, dry_run: bool
 
         src_size, up_size = src.stat().st_size, out.stat().st_size
         remove_quietly(out)
-        if cfg.delete_original_after_upload:
+        if should_delete_original(cfg, source):
             os.remove(src)
-        log.info("Uploaded game=%s source=%.1fMB upload=%.1fMB took=%.0fs",
-                 game, src_size / 1048576, up_size / 1048576, time.time() - t0)
+        log.info("Uploaded %s game=%s source=%.1fMB upload=%.1fMB took=%.0fs",
+                 source_name, game, src_size / 1048576, up_size / 1048576, time.time() - t0)
         return True
     except Exception as e:  # noqa: BLE001 - per-clip isolation
         log.exception("Failed to process %s: %s", src, e)
@@ -535,25 +611,48 @@ def acquire_lock() -> socket.socket | None:
 def watch(cfg: Config, tools: tuple[Path, Path],
           stop: threading.Event | None = None,
           paused: threading.Event | None = None) -> None:
-    seen = scan(cfg.watch_dir, cfg.filename_suffix)
-    log.info("Watching %s (%d existing clips ignored)", cfg.watch_dir, len(seen))
+    sources = get_sources(cfg)
+    seen: set[str] = set()
+    ready: set[str] = set()      # sources whose folder has been scanned once (baseline taken)
+    missing_logged: set[str] = set()
+
+    def poll_source(src: Source) -> list[tuple[Source, str]]:
+        """New files of one source, in order. Takes the baseline on the first good scan."""
+        if not src.dir.is_dir():
+            if src.name not in missing_logged:
+                missing_logged.add(src.name)
+                log.warning("%s folder not found: %s (will keep checking)", src.name, src.dir)
+            return []
+        current = scan(str(src.dir), src.suffix)
+        if src.name not in ready:
+            ready.add(src.name)
+            seen.update(current)
+            log.info("Watching %s %s (%d existing clips ignored)", src.name, src.dir, len(current))
+            return []
+        new = sorted(current - seen)
+        seen.update(new)  # the first source to list a path owns it
+        return [(src, p) for p in new]
+
+    for src in sources:
+        poll_source(src)
+    if not sources:
+        log.warning("No clip source is enabled; nothing to watch")
     while not (stop and stop.is_set()):
         try:
-            current = scan(cfg.watch_dir, cfg.filename_suffix)
-            if paused is not None and paused.is_set():
-                seen |= current  # clips saved while paused are skipped for good
-            else:
-                for path in sorted(current - seen):
-                    if stop and stop.is_set():
-                        return
-                    seen.add(path)
-                    if paused is not None and paused.is_set():
-                        continue
-                    if not wait_until_stable(path):
-                        log.error("Timed out waiting for %s to finish writing", path)
-                        notify("Clip not processed", f"Timed out waiting for {Path(path).name}")
-                        continue
-                    process_clip(cfg, tools, Path(path), dry_run=False)
+            found: list[tuple[Source, str]] = []
+            for src in sources:
+                found.extend(poll_source(src))
+            # clips saved while paused are already in seen and are skipped for good
+            for src, path in found:
+                if stop and stop.is_set():
+                    return
+                if paused is not None and paused.is_set():
+                    continue
+                if not wait_until_stable(path):
+                    log.error("Timed out waiting for %s to finish writing", path)
+                    notify("Clip not processed", f"Timed out waiting for {Path(path).name}")
+                    continue
+                process_clip(cfg, tools, Path(path), dry_run=False, source=src)
         except Exception:  # noqa: BLE001 - never kill the loop
             log.exception("Error in watch loop")
         if stop is not None:
@@ -598,8 +697,11 @@ def main() -> int:
     lock = acquire_lock()
     if lock is None:
         return 0
-    if not Path(cfg.watch_dir).is_dir():
-        return fail(f"watch_dir does not exist: {cfg.watch_dir}")
+    sources = get_sources(cfg)
+    if not sources:
+        return fail("no clip source is enabled (check nvidia_enabled, medal_enabled and medal_dir)")
+    if not any(s.dir.is_dir() for s in sources):
+        return fail("no clips folder exists: " + ", ".join(f"{s.name}: {s.dir}" for s in sources))
     watch(cfg, tools)
     return 0
 

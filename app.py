@@ -33,7 +33,7 @@ from PIL import Image, ImageDraw
 
 import clip_watcher
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 APP_NAME = "Clip to Discord"
 REPO = "odehamer/clip-to-discord"
 
@@ -140,12 +140,37 @@ def select_zip_members(names: list[str]) -> dict[str, str]:
     return chosen
 
 
-def merge_config(existing: dict, webhook_url: str, delete_original: bool) -> dict:
-    """Return existing config with the two app-controlled keys set; other keys are kept."""
+def merge_config(existing: dict, webhook_url: str, delete_original: bool,
+                 nvidia_enabled: bool = True, medal_enabled: bool = False,
+                 medal_dir: str = "") -> dict:
+    """Return existing config with the app-controlled keys set; other keys are kept."""
     merged = dict(existing)
     merged["webhook_url"] = webhook_url
     merged["delete_original_after_upload"] = bool(delete_original)
+    merged["nvidia_enabled"] = bool(nvidia_enabled)
+    merged["medal_enabled"] = bool(medal_enabled)
+    merged["medal_dir"] = str(medal_dir)
     return merged
+
+
+def normalize_medal_dir(folder: str) -> str:
+    """If the chosen folder is Medal's capture folder (holds a 'Clips' folder), use Clips."""
+    folder = folder.strip()
+    if not folder:
+        return folder
+    p = Path(folder)
+    if p.name.lower() != "clips" and (p / "Clips").is_dir():
+        return str(p / "Clips")
+    return folder
+
+
+def initial_sources(raw: dict, valid: bool, nvidia_found: bool, medal_found: bool) -> tuple[bool, bool]:
+    """Which source boxes start ticked: detection on first run, saved values afterwards."""
+    if valid:
+        return bool(raw.get("nvidia_enabled", True)), bool(raw.get("medal_enabled", False))
+    if not nvidia_found and not medal_found:
+        return True, False
+    return nvidia_found, medal_found
 
 
 def parse_sha256(text: str) -> str:
@@ -183,8 +208,11 @@ def load_raw_config(path: Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def save_config(path: Path, webhook_url: str, delete_original: bool) -> dict:
-    merged = merge_config(load_raw_config(path), webhook_url, delete_original)
+def save_config(path: Path, webhook_url: str, delete_original: bool,
+                nvidia_enabled: bool = True, medal_enabled: bool = False,
+                medal_dir: str = "") -> dict:
+    merged = merge_config(load_raw_config(path), webhook_url, delete_original,
+                          nvidia_enabled, medal_enabled, medal_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(merged, indent=2), encoding="utf-8")
@@ -365,6 +393,14 @@ def nvidia_detected() -> bool:
             return True
     except OSError:
         return False
+
+
+def medal_detected() -> bool:
+    for var, sub in (("APPDATA", "Medal"), ("LOCALAPPDATA", r"Programs\Medal")):
+        base = os.environ.get(var)
+        if base and (Path(base) / sub).exists():
+            return True
+    return clip_watcher.detect_medal_dir() is not None
 
 
 # --------------------------------------------------------------------------
@@ -549,12 +585,17 @@ def schedule_dir_removal(app_dir: Path) -> None:
 # --------------------------------------------------------------------------
 
 DELETE_LABEL = "Delete the original clip after it's posted. The Discord copy will be the only copy."
-NO_NVIDIA_WARNING = ("No NVIDIA software was found on this PC. Clips come from NVIDIA Instant "
-                     "Replay, so nothing will be posted without it.")
-INTRO = ("Press your NVIDIA Instant Replay hotkey in a game and the last 30 seconds are "
-         "posted to your Discord channel.")
-BEFORE_START = ("1. Press Alt+Z in a game to open the NVIDIA overlay.\n"
-                "2. Turn Instant Replay on. Your save hotkey (Alt+F10 by default) then posts a clip.")
+NO_SOURCE_WARNING = ("Neither NVIDIA software nor Medal was found on this PC. "
+                     "Install one of them to record clips.")
+INTRO = ("Save a clip in a game with NVIDIA Instant Replay or Medal, and the last 30 seconds "
+         "are posted to your Discord channel.")
+NVIDIA_HELP = ("In a game, press Alt+Z, turn Instant Replay on, then use your save hotkey "
+               "(Alt+F10 by default).")
+MEDAL_HELP = "Clips you save with Medal are posted. Medal keeps its own copy."
+DELETE_NOTE = "Applies to NVIDIA clips. Medal clips are always kept."
+NO_SOURCE_ERROR = "Tick at least one place your clips come from."
+MEDAL_FOLDER_ERROR = ("Choose your Medal clips folder. In Medal: Settings \u2192 PC Storage shows "
+                      "where it is; pick the Clips folder inside it.")
 RUNNING_NOTE = "Clip to Discord is running. Look for the icon near the clock."
 WIDTH = 480
 
@@ -584,6 +625,13 @@ class SettingsWindow:
         self.show_var = tk.BooleanVar(value=False)
         self.autostart_var = tk.BooleanVar(value=autostart_enabled() if valid else True)
         self.delete_var = tk.BooleanVar(value=bool(raw.get("delete_original_after_upload", True)))
+        nvidia_found, medal_found = nvidia_detected(), medal_detected()
+        self.sources_found = (nvidia_found, medal_found)
+        nv_on, md_on = initial_sources(raw, valid, nvidia_found, medal_found)
+        self.nvidia_var = tk.BooleanVar(value=nv_on)
+        self.medal_var = tk.BooleanVar(value=md_on)
+        self.medal_dir_var = tk.StringVar(
+            value=str(raw.get("medal_dir") or "") or clip_watcher.detect_medal_dir() or "")
         self.msg_var = tk.StringVar()
         self.progress_text = tk.StringVar()
         self._build()
@@ -597,11 +645,28 @@ class SettingsWindow:
         ttk.Label(f, text=APP_NAME, font=("Segoe UI", 16, "bold")).pack(anchor="w")
         ttk.Label(f, text=INTRO, wraplength=WIDTH - 40).pack(anchor="w", pady=(4, 12))
 
-        box = ttk.LabelFrame(f, text="Before you start", padding=10)
+        box = ttk.LabelFrame(f, text="Where your clips come from", padding=10)
         box.pack(fill="x")
-        ttk.Label(box, text=BEFORE_START, wraplength=WIDTH - 60, justify="left").pack(anchor="w")
-        if not nvidia_detected():
-            self.warning = ttk.Label(box, text=NO_NVIDIA_WARNING, wraplength=WIDTH - 60,
+        self.nvidia_cb = ttk.Checkbutton(box, text="NVIDIA Instant Replay", variable=self.nvidia_var)
+        self.nvidia_cb.pack(anchor="w")
+        ttk.Label(box, text=NVIDIA_HELP, wraplength=WIDTH - 80, justify="left",
+                  foreground="#666666").pack(anchor="w", padx=(24, 0), pady=(0, 8))
+        self.medal_cb = ttk.Checkbutton(box, text="Medal", variable=self.medal_var,
+                                        command=self._update_medal_state)
+        self.medal_cb.pack(anchor="w")
+        ttk.Label(box, text=MEDAL_HELP, wraplength=WIDTH - 80, justify="left",
+                  foreground="#666666").pack(anchor="w", padx=(24, 0), pady=(0, 4))
+        mrow = ttk.Frame(box)
+        mrow.pack(fill="x", padx=(24, 0))
+        self.medal_label = ttk.Label(mrow, text="Medal clips folder")
+        self.medal_label.pack(side="left")
+        self.medal_entry = ttk.Entry(mrow, textvariable=self.medal_dir_var, state="readonly")
+        self.medal_entry.pack(side="left", fill="x", expand=True, padx=(8, 8))
+        self.medal_browse_btn = ttk.Button(mrow, text="Browse\u2026", command=self.on_browse_medal)
+        self.medal_browse_btn.pack(side="left")
+        self._update_medal_state()
+        if not (self.sources_found[0] or self.sources_found[1]):
+            self.warning = ttk.Label(box, text=NO_SOURCE_WARNING, wraplength=WIDTH - 60,
                                      foreground="#b45309", justify="left")
             self.warning.pack(anchor="w", pady=(8, 0))
 
@@ -627,6 +692,8 @@ class SettingsWindow:
         self.delete_cb = tk.Checkbutton(f, text=DELETE_LABEL, variable=self.delete_var,
                                         anchor="w", justify="left", wraplength=WIDTH - 60)
         self.delete_cb.pack(anchor="w", fill="x")
+        tk.Label(f, text=DELETE_NOTE, anchor="w", justify="left", fg="#666666",
+                 wraplength=WIDTH - 60).pack(anchor="w", fill="x", padx=(22, 0))
 
         self.progress_frame = ttk.Frame(f)
         ttk.Label(self.progress_frame, textvariable=self.progress_text,
@@ -647,6 +714,21 @@ class SettingsWindow:
     def fit(self) -> None:
         self.top.update_idletasks()
         self.top.geometry(f"{WIDTH}x{self.top.winfo_reqheight()}")
+
+    def _update_medal_state(self) -> None:
+        on = self.medal_var.get()
+        self.medal_entry.configure(state="readonly" if on else "disabled")
+        self.medal_browse_btn.configure(state="normal" if on else "disabled")
+        self.medal_label.configure(state="normal" if on else "disabled")
+
+    def on_browse_medal(self) -> None:
+        from tkinter import filedialog
+        current = self.medal_dir_var.get()
+        start = current if current and Path(current).is_dir() else None
+        chosen = filedialog.askdirectory(parent=self.top, title="Choose your Medal clips folder",
+                                         initialdir=start, mustexist=True)
+        if chosen:
+            self.medal_dir_var.set(normalize_medal_dir(str(Path(chosen))))
 
     def _toggle_show(self) -> None:
         self.entry.configure(show="" if self.show_var.get() else "\u2022")
@@ -731,12 +813,30 @@ class SettingsWindow:
         self.test_btn.configure(state="normal")
         self.set_message(text, kind)
 
+    def _valid_sources(self) -> str | None:
+        """Returns the Medal folder to save ('' when Medal is off), or None after showing an error."""
+        if not self.nvidia_var.get() and not self.medal_var.get():
+            self.set_message(NO_SOURCE_ERROR, "error")
+            return None
+        if not self.medal_var.get():
+            return self.medal_dir_var.get().strip()
+        folder = normalize_medal_dir(self.medal_dir_var.get())
+        if not folder or not Path(folder).is_dir():
+            self.set_message(MEDAL_FOLDER_ERROR, "error")
+            return None
+        self.medal_dir_var.set(folder)
+        return folder
+
     def on_save(self) -> None:
+        medal_dir = self._valid_sources()
+        if medal_dir is None:
+            return
         url = self._valid_url()
         if not url:
             return
         try:
-            save_config(self.app.paths.config, url, self.delete_var.get())
+            save_config(self.app.paths.config, url, self.delete_var.get(),
+                        self.nvidia_var.get(), self.medal_var.get(), medal_dir)
         except OSError as e:
             self.set_message(f"Could not save your settings ({e.strerror or e}).", "error")
             return
@@ -1009,11 +1109,13 @@ class App:
         if cfg is None or tools is None:
             self.set_state("setup")
             return
-        if not Path(cfg.watch_dir).is_dir():
+        sources = clip_watcher.get_sources(cfg)
+        if not any(src.dir.is_dir() for src in sources):
             self.set_state("setup")
-            self.notify(APP_NAME, "The Videos folder was not found, so nothing can be watched. "
-                                  "Set watch_dir in the settings file or create the folder.")
-            log.error("watch_dir does not exist: %s", cfg.watch_dir)
+            self.notify(APP_NAME, "No clips folder was found. Open Settings to check where "
+                                  "your clips come from.")
+            log.error("no clips folder exists: %s",
+                      ", ".join(f"{src.name}: {src.dir}" for src in sources) or "no source enabled")
             return
         stop = threading.Event()
 

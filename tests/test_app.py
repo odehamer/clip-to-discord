@@ -181,7 +181,8 @@ class WatchTests(unittest.TestCase):
             processed = []
             with mock.patch.object(clip_watcher, "wait_until_stable", return_value=True), \
                     mock.patch.object(clip_watcher, "process_clip",
-                                      side_effect=lambda cfg, tools, p, dry_run: processed.append(p.name)):
+                                      side_effect=lambda cfg, tools, p, dry_run, source=None:
+                                      processed.append(p.name)):
                 t = threading.Thread(target=clip_watcher.watch,
                                      args=(self._cfg(d), (Path("a"), Path("b")), stop, paused))
                 t.start()
@@ -368,6 +369,288 @@ class GuiSmokeTests(unittest.TestCase):
                 a.root = None
                 w = None
                 gc.collect()
+
+
+class SourceTests(unittest.TestCase):
+    def test_old_config_is_nvidia_only(self):
+        cfg = clip_watcher.Config(watch_dir=r"C:\V", filename_suffix=".DVR.mp4",
+                                  delete_original_after_upload=False)
+        self.assertEqual(clip_watcher.get_sources(cfg),
+                         [clip_watcher.Source("NVIDIA", Path(r"C:\V"), ".DVR.mp4", False)])
+
+    def test_both_enabled_and_order(self):
+        cfg = clip_watcher.Config(watch_dir=r"C:\V", medal_enabled=True, medal_dir=r"D:\M\Clips",
+                                  medal_delete_original=True)
+        srcs = clip_watcher.get_sources(cfg)
+        self.assertEqual([s.name for s in srcs], ["NVIDIA", "Medal"])
+        self.assertEqual(srcs[1], clip_watcher.Source("Medal", Path(r"D:\M\Clips"), ".mp4", True))
+
+    def test_nvidia_can_be_disabled(self):
+        cfg = clip_watcher.Config(watch_dir=r"C:\V", nvidia_enabled=False,
+                                  medal_enabled=True, medal_dir=r"D:\M")
+        self.assertEqual([s.name for s in clip_watcher.get_sources(cfg)], ["Medal"])
+
+    def test_medal_without_folder_is_left_out(self):
+        cfg = clip_watcher.Config(watch_dir=r"C:\V", medal_enabled=True)
+        with mock.patch.object(clip_watcher, "detect_medal_dir", return_value=None):
+            self.assertEqual([s.name for s in clip_watcher.get_sources(cfg)], ["NVIDIA"])
+        with mock.patch.object(clip_watcher, "detect_medal_dir", return_value=r"E:\Medal\Clips"):
+            srcs = clip_watcher.get_sources(cfg)
+            self.assertEqual(srcs[1].dir, Path(r"E:\Medal\Clips"))
+
+    def test_detect_medal_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            (d / "b").mkdir()
+            (d / "c").mkdir()
+            self.assertEqual(clip_watcher.detect_medal_dir([d / "a", d / "b", d / "c"]), str(d / "b"))
+            self.assertIsNone(clip_watcher.detect_medal_dir([d / "a"]))
+
+    def test_old_config_file_loads(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "config.json"
+            p.write_text(json.dumps({"webhook_url": "x", "watch_dir": d}))
+            cfg = clip_watcher.load_config(p, False)
+            self.assertTrue(cfg.nvidia_enabled)
+            self.assertFalse(cfg.medal_enabled)
+            self.assertEqual(cfg.medal_dir, "")
+
+    def test_should_delete_original(self):
+        cfg = clip_watcher.Config(delete_original_after_upload=True, medal_delete_original=False)
+        nv = clip_watcher.Source("NVIDIA", Path("a"), ".DVR.mp4", True)
+        md = clip_watcher.Source("Medal", Path("b"), ".mp4", False)
+        self.assertTrue(clip_watcher.should_delete_original(cfg, None))
+        self.assertTrue(clip_watcher.should_delete_original(cfg, nv))
+        self.assertFalse(clip_watcher.should_delete_original(cfg, md))
+        cfg2 = clip_watcher.Config(delete_original_after_upload=False)
+        self.assertFalse(clip_watcher.should_delete_original(cfg2, None))
+        self.assertTrue(clip_watcher.should_delete_original(
+            cfg2, clip_watcher.Source("Medal", Path("b"), ".mp4", True)))
+
+
+class GameNameTests(unittest.TestCase):
+    def test_medal_name(self):
+        f = clip_watcher.game_from_medal_name
+        self.assertEqual(f("MedalTVValorant20240115123456"), "Valorant")
+        self.assertEqual(f("medaltv_Rocket League_2024-01-15"), "Rocket League")
+        self.assertEqual(f("Apex Legends 2024"), "Apex Legends")
+        self.assertIsNone(f("20240115123456"))
+        self.assertIsNone(f("MedalTV123"))
+        self.assertIsNone(f("a1"))
+
+    def test_derive(self):
+        base = Path(r"C:\Videos")
+        d = clip_watcher.derive_game_name
+        self.assertEqual(d(base / "Test Game 2026.11.10 - 12.00.00.01.DVR.mp4", base), "Test Game")
+        self.assertEqual(d(base / "Test Game" / "x 2026.11.10 - 12.00.00.01.DVR.mp4", base), "Test Game")
+        self.assertEqual(d(base / "MedalTVValorant20240115123456.mp4", base), "Valorant")
+        self.assertEqual(d(base / "Valorant" / "whatever.mp4", base), "Valorant")
+        self.assertEqual(d(base / "12345.mp4", base), "Clip")
+        self.assertEqual(d(base / "Desktop 2026.DVR.mp4", base), "Desktop")
+
+    def test_upload_filename(self):
+        up = clip_watcher.upload_filename
+        self.assertEqual(up("Test Game", Path("Test Game 2026.11.10 - 12.00.00.01.DVR.mp4")),
+                         "Test Game 2026-11-10 12.00.mp4")
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "MedalTVValorant1.mp4"
+            f.write_bytes(b"x")
+            ts = time.mktime((2024, 1, 15, 12, 34, 56, 0, 0, -1))
+            os.utime(f, (ts, ts))
+            self.assertEqual(up("Valorant", f), "Valorant 2024-01-15 12.34.mp4")
+        self.assertEqual(up("Valorant", Path(r"Z:\missing\a.mp4")), "Valorant.mp4")
+
+
+class MultiSourceWatchTests(unittest.TestCase):
+    def _run(self, cfg, actions):
+        """Run watch() with process_clip recording (file name, source); actions runs meanwhile."""
+        stop = threading.Event()
+        calls = []
+        with mock.patch.object(clip_watcher, "wait_until_stable", return_value=True), \
+                mock.patch.object(clip_watcher, "process_clip",
+                                  side_effect=lambda cfg, tools, p, dry_run, source=None:
+                                  calls.append((p.name, source))):
+            t = threading.Thread(target=clip_watcher.watch,
+                                 args=(cfg, (Path("a"), Path("b")), stop))
+            t.start()
+            try:
+                time.sleep(0.3)
+                actions()
+                time.sleep(0.5)
+            finally:
+                stop.set()
+                t.join(3)
+        return calls
+
+    def test_both_sources(self):
+        with tempfile.TemporaryDirectory() as d:
+            nv, md = Path(d) / "nv", Path(d) / "md"
+            nv.mkdir()
+            md.mkdir()
+            (md / "old.mp4").write_bytes(b"0")
+            cfg = clip_watcher.Config(webhook_url="x", watch_dir=str(nv), medal_enabled=True,
+                                      medal_dir=str(md), poll_seconds=0.05)
+
+            def act():
+                (nv / "G 2026.01.02 - 03.04.05.06.DVR.mp4").write_bytes(b"1")
+                (nv / "plain.mp4").write_bytes(b"2")
+                (md / "MedalTVValorant1.mp4").write_bytes(b"3")
+
+            calls = self._run(cfg, act)
+            by_name = {n: s for n, s in calls}
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(by_name["G 2026.01.02 - 03.04.05.06.DVR.mp4"].name, "NVIDIA")
+            self.assertEqual(by_name["MedalTVValorant1.mp4"].name, "Medal")
+            self.assertEqual(by_name["MedalTVValorant1.mp4"].dir, md)
+
+    def test_overlap_first_source_wins(self):
+        with tempfile.TemporaryDirectory() as d:
+            nv = Path(d) / "videos"
+            nv.mkdir()
+            cfg = clip_watcher.Config(webhook_url="x", watch_dir=str(nv), medal_enabled=True,
+                                      medal_dir=str(nv), filename_suffix=".mp4", poll_seconds=0.05)
+            calls = self._run(cfg, lambda: (nv / "a.mp4").write_bytes(b"1"))
+            self.assertEqual([(n, s.name) for n, s in calls], [("a.mp4", "NVIDIA")])
+
+    def test_medal_dir_created_later(self):
+        with tempfile.TemporaryDirectory() as d:
+            nv, md = Path(d) / "nv", Path(d) / "md"
+            nv.mkdir()
+            cfg = clip_watcher.Config(webhook_url="x", watch_dir=str(nv), medal_enabled=True,
+                                      medal_dir=str(md), poll_seconds=0.05)
+
+            def act():
+                md.mkdir()
+                (md / "initial.mp4").write_bytes(b"1")
+                time.sleep(0.4)
+                (md / "later.mp4").write_bytes(b"2")
+
+            calls = self._run(cfg, act)
+            self.assertEqual([(n, s.name) for n, s in calls], [("later.mp4", "Medal")])
+
+
+class MedalConfigTests(unittest.TestCase):
+    def test_merge_new_keys_keeps_unknown(self):
+        merged = app.merge_config({"custom": 1, "clip_seconds": 20, "watch_dir": "V"},
+                                  "u", True, False, True, r"D:\Medal\Clips")
+        self.assertEqual(merged["custom"], 1)
+        self.assertEqual(merged["clip_seconds"], 20)
+        self.assertEqual(merged["watch_dir"], "V")
+        self.assertIs(merged["nvidia_enabled"], False)
+        self.assertIs(merged["medal_enabled"], True)
+        self.assertEqual(merged["medal_dir"], r"D:\Medal\Clips")
+        self.assertIs(merged["delete_original_after_upload"], True)
+
+    def test_save_config_roundtrip(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "config.json"
+            app.save_config(p, "https://discord.com/api/webhooks/1/abc", False, True, True, "M")
+            cfg = clip_watcher.load_config(p, False)
+            self.assertTrue(cfg.nvidia_enabled and cfg.medal_enabled)
+            self.assertEqual(cfg.medal_dir, "M")
+            self.assertFalse(cfg.medal_delete_original)
+
+    def test_normalize_medal_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "Medal"
+            (root / "Clips").mkdir(parents=True)
+            (root / "Editor").mkdir()
+            self.assertEqual(app.normalize_medal_dir(str(root)), str(root / "Clips"))
+            self.assertEqual(app.normalize_medal_dir(str(root / "Clips")), str(root / "Clips"))
+            self.assertEqual(app.normalize_medal_dir(str(root / "Editor")), str(root / "Editor"))
+            self.assertEqual(app.normalize_medal_dir(""), "")
+
+    def test_initial_sources(self):
+        f = app.initial_sources
+        self.assertEqual(f({}, False, True, False), (True, False))
+        self.assertEqual(f({}, False, False, True), (False, True))
+        self.assertEqual(f({}, False, True, True), (True, True))
+        self.assertEqual(f({}, False, False, False), (True, False))
+        self.assertEqual(f({"webhook_url": "x"}, True, False, True), (True, False))
+        self.assertEqual(f({"nvidia_enabled": False, "medal_enabled": True}, True, True, False),
+                         (False, True))
+
+    def test_version(self):
+        self.assertEqual(app.__version__, "1.1.0")
+
+
+class SourceWindowTests(unittest.TestCase):
+    def _window(self):
+        a = app.App(app.default_paths())
+        try:
+            a.create_root()
+        except Exception as e:  # noqa: BLE001
+            self.skipTest(f"Tk unavailable: {e}")
+        a.window = app.SettingsWindow(a)
+        for _ in range(3):
+            a.root.update()
+        return a
+
+    def _close(self, a):
+        a.root.destroy()
+        a.window = None
+        a.root = None
+        gc.collect()
+
+    def test_checkboxes_and_validation(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {app.HOME_ENV: d}), \
+                mock.patch.object(app, "nvidia_detected", return_value=False), \
+                mock.patch.object(app, "medal_detected", return_value=False), \
+                mock.patch.object(clip_watcher, "detect_medal_dir", return_value=None):
+            a = self._window()
+            try:
+                w = a.window
+                self.assertEqual(w.nvidia_cb.cget("text"), "NVIDIA Instant Replay")
+                self.assertEqual(w.medal_cb.cget("text"), "Medal")
+                # nothing detected: NVIDIA ticked, warning shown, folder row disabled
+                self.assertTrue(w.nvidia_var.get())
+                self.assertFalse(w.medal_var.get())
+                self.assertTrue(hasattr(w, "warning"))
+                self.assertEqual(str(w.medal_browse_btn.cget("state")), "disabled")
+                w.webhook_var.set("https://discord.com/api/webhooks/1/abc")
+
+                w.nvidia_var.set(False)
+                w.on_save()
+                self.assertEqual(w.msg_var.get(), app.NO_SOURCE_ERROR)
+
+                w.medal_var.set(True)
+                w._update_medal_state()
+                self.assertEqual(str(w.medal_browse_btn.cget("state")), "normal")
+                w.medal_dir_var.set("")
+                w.on_save()
+                self.assertIn("Medal clips folder", w.msg_var.get())
+
+                w.medal_dir_var.set(str(Path(d) / "does-not-exist"))
+                w.on_save()
+                self.assertIn("Medal clips folder", w.msg_var.get())
+                self.assertFalse(app.default_paths().config.exists())
+            finally:
+                self._close(a)
+
+    def test_medal_detected_defaults_and_save(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {app.HOME_ENV: d}):
+            medal = Path(d) / "Medal"
+            (medal / "Clips").mkdir(parents=True)
+            with mock.patch.object(app, "nvidia_detected", return_value=False), \
+                    mock.patch.object(app, "medal_detected", return_value=True), \
+                    mock.patch.object(clip_watcher, "detect_medal_dir", return_value=None), \
+                    mock.patch.object(app.App, "prepare_and_start"), \
+                    mock.patch.object(app, "set_autostart"):
+                a = self._window()
+                try:
+                    w = a.window
+                    self.assertFalse(w.nvidia_var.get())
+                    self.assertTrue(w.medal_var.get())
+                    self.assertFalse(hasattr(w, "warning"))
+                    w.webhook_var.set("https://discord.com/api/webhooks/1/abc")
+                    w.medal_dir_var.set(str(medal))  # capture folder -> Clips inside it
+                    w.on_save()
+                    saved = json.loads(app.default_paths().config.read_text())
+                    self.assertIs(saved["medal_enabled"], True)
+                    self.assertIs(saved["nvidia_enabled"], False)
+                    self.assertEqual(saved["medal_dir"], str(medal / "Clips"))
+                finally:
+                    self._close(a)
 
 
 if __name__ == "__main__":

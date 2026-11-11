@@ -9,5 +9,9 @@
   "delete_original_after_upload": true,
   "poll_seconds": 2,
   "filename_suffix": ".DVR.mp4",
-  "ffmpeg_path": null
+  "ffmpeg_path": null,
+  "nvidia_enabled": true,
+  "medal_enabled": false,
+  "medal_dir": "",
+  "medal_delete_original": false
 }
